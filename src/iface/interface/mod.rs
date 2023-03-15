@@ -236,6 +236,8 @@ pub struct InterfaceInner {
     caps: DeviceCapabilities,
     now: Instant,
     rand: Rand,
+    
+    use_sixlowpan_ghc: bool,
 
     #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
     neighbor_cache: Option<NeighborCache>,
@@ -548,6 +550,7 @@ impl Interface {
                 caps,
                 #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
                 hardware_addr,
+                use_sixlowpan_ghc: true,
                 ip_addrs: Vec::new(),
                 #[cfg(feature = "proto-ipv4")]
                 any_ip: false,
@@ -1136,6 +1139,8 @@ impl InterfaceInner {
                 max_transmission_unit: 1500,
             },
             now: Instant::from_millis_const(0),
+            
+            use_sixlowpan_ghc: true,
 
             ip_addrs: Vec::from_slice(&[
                 #[cfg(feature = "proto-ipv4")]

@@ -1450,6 +1450,7 @@ pub mod nhc {
     pub enum NhcPacket {
         ExtHeader,
         UdpHeader,
+        UdpGhcHeader
     }
 
     impl NhcPacket {
@@ -1471,6 +1472,9 @@ pub mod nhc {
             } else if raw[0] >> 3 == DISPATCH_UDP_HEADER {
                 // We have a compressed UDP header.
                 Ok(Self::UdpHeader)
+            } else if raw[0] >> 3 == 0b11010 {
+                // We have a UDP GHC packet
+                Ok(Self::UdpGhcHeader)
             } else {
                 Err(Error)
             }

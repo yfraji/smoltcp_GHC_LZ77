@@ -192,6 +192,11 @@ impl InterfaceInner {
                         decompressed_size -= udp_repr.header_len();
                         IpProtocol::Udp
                     }
+                    SixlowpanNhcPacket::UdpGhcHeader => {
+                        // Here we calculate the size of the uncompressed UDP-GHC packet.
+                        todo!();
+                        IpProtocol::Udp
+                    }
                 }
             }
             SixlowpanNextHeader::Uncompressed(proto) => proto,
@@ -244,6 +249,10 @@ impl InterfaceInner {
                         udp_repr.0.emit_header(&mut udp, ipv6_repr.payload_len - 8);
 
                         buffer[8..].copy_from_slice(&iphc.payload()[udp_repr.header_len()..]);
+                    }
+                    SixlowpanNhcPacket::UdpGhcHeader => {
+                        // Here we decompress the packet into the buffer.
+                        todo!();
                     }
                 }
             }
@@ -330,10 +339,15 @@ impl InterfaceInner {
         match packet {
             #[cfg(feature = "socket-udp")]
             IpPacket::Udp((_, udpv6_repr, payload)) => {
-                let udp_repr = SixlowpanUdpNhcRepr(udpv6_repr);
-                _compressed_headers_len += udp_repr.header_len();
-                _uncompressed_headers_len += udpv6_repr.header_len();
-                total_size += udp_repr.header_len() + payload.len();
+                if self.use_sixlowpan_ghc {
+                    // Here we calculate the size of the compressed packet.
+                    todo!();
+                } else {
+                    let udp_repr = SixlowpanUdpNhcRepr(udpv6_repr);
+                    _compressed_headers_len += udp_repr.header_len();
+                    _uncompressed_headers_len += udpv6_repr.header_len();
+                    total_size += udp_repr.header_len() + payload.len();
+                }
             }
             #[cfg(feature = "socket-tcp")]
             IpPacket::Tcp((_, tcp_repr)) => {
@@ -382,6 +396,7 @@ impl InterfaceInner {
                 match packet {
                     #[cfg(feature = "socket-udp")]
                     IpPacket::Udp((_, udpv6_repr, payload)) => {
+                        // TODO: check if we need to use GHC or not
                         let udp_repr = SixlowpanUdpNhcRepr(udpv6_repr);
                         let mut udp_packet = SixlowpanUdpNhcPacket::new_unchecked(
                             &mut b[..udp_repr.header_len() + payload.len()],
@@ -496,17 +511,21 @@ impl InterfaceInner {
                 match packet {
                     #[cfg(feature = "socket-udp")]
                     IpPacket::Udp((_, udpv6_repr, payload)) => {
-                        let udp_repr = SixlowpanUdpNhcRepr(udpv6_repr);
-                        let mut udp_packet = SixlowpanUdpNhcPacket::new_unchecked(
-                            &mut tx_buf[..udp_repr.header_len() + payload.len()],
-                        );
-                        udp_repr.emit(
-                            &mut udp_packet,
-                            &iphc_repr.src_addr,
-                            &iphc_repr.dst_addr,
-                            payload.len(),
-                            |buf| buf.copy_from_slice(payload),
-                        );
+                        if self.use_sixlowpan_ghc {
+                            todo!();
+                        } else {
+                            let udp_repr = SixlowpanUdpNhcRepr(udpv6_repr);
+                            let mut udp_packet = SixlowpanUdpNhcPacket::new_unchecked(
+                                &mut tx_buf[..udp_repr.header_len() + payload.len()],
+                            );
+                            udp_repr.emit(
+                                &mut udp_packet,
+                                &iphc_repr.src_addr,
+                                &iphc_repr.dst_addr,
+                                payload.len(),
+                                |buf| buf.copy_from_slice(payload),
+                            );
+                        }
                     }
                     #[cfg(feature = "socket-tcp")]
                     IpPacket::Tcp((_, tcp_repr)) => {
