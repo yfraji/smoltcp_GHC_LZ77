@@ -148,8 +148,11 @@ pub use self::sixlowpan::{
     iphc::{Packet as SixlowpanIphcPacket, Repr as SixlowpanIphcRepr},
     nhc::{
         ExtHeaderPacket as SixlowpanExtHeaderPacket, ExtHeaderRepr as SixlowpanExtHeaderRepr,
-        NhcPacket as SixlowpanNhcPacket, UdpNhcPacket as SixlowpanUdpNhcPacket,
+        NhcPacket as SixlowpanNhcPacket,
+        UdpNhcPacket as SixlowpanUdpNhcPacket,
         UdpNhcRepr as SixlowpanUdpNhcRepr,
+        UdpGhcPacket as SixlowpanUdpGhcPacket,
+        UdpGhcRepr as SixlowpanUdpGhcRepr,
     },
     AddressContext as SixlowpanAddressContext, NextHeader as SixlowpanNextHeader, SixlowpanPacket,
 };

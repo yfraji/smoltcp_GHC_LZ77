@@ -1,3 +1,4 @@
+use crate::iface::fragmentation::AssemblerFullError;
 use super::*;
 
 use crate::phy::ChecksumCapabilities;
@@ -89,7 +90,7 @@ impl InterfaceInner {
         payload: &'payload T,
         f: &'output mut FragmentsBuffer,
     ) -> Option<&'output [u8]> {
-        use crate::iface::fragmentation::{AssemblerError, AssemblerFullError};
+        use crate::iface::fragmentation::AssemblerError;
 
         // We have a fragment header, which means we cannot process the 6LoWPAN packet,
         // unless we have a complete one after processing this fragment.
@@ -194,7 +195,17 @@ impl InterfaceInner {
                     }
                     SixlowpanNhcPacket::UdpGhcHeader => {
                         // Here we calculate the size of the uncompressed UDP-GHC packet.
-                        todo!();
+                        // todo!(); done
+                        let udp_packet = SixlowpanUdpGhcPacket::new_checked(iphc.payload())?;
+                        let udp_repr = SixlowpanUdpGhcRepr::parse(
+                            &udp_packet,
+                            &iphc_repr.src_addr,
+                            &iphc_repr.dst_addr,
+                            &crate::phy::ChecksumCapabilities::ignored(),
+                        )?;
+
+                        decompressed_size += 8;
+                        decompressed_size -= udp_repr.header_len();
                         IpProtocol::Udp
                     }
                 }
@@ -252,7 +263,22 @@ impl InterfaceInner {
                     }
                     SixlowpanNhcPacket::UdpGhcHeader => {
                         // Here we decompress the packet into the buffer.
-                        todo!();
+                        // todo!(); done
+                        let udp_packet = SixlowpanUdpGhcPacket::new_checked(iphc.payload())?;
+                        let udp_repr = SixlowpanUdpGhcRepr::parse(
+                            &udp_packet,
+                            &iphc_repr.src_addr,
+                            &iphc_repr.dst_addr,
+                            &ChecksumCapabilities::ignored(),
+                        )?;
+
+                        let mut udp = UdpPacket::new_unchecked(
+                            &mut buffer[..udp_repr.0.header_len() + iphc.payload().len()
+                                - udp_repr.header_len()],
+                        );
+                        udp_repr.0.emit_header(&mut udp, ipv6_repr.payload_len - 8);
+
+                        buffer[8..].copy_from_slice(&iphc.payload()[udp_repr.header_len()..]);
                     }
                 }
             }
@@ -341,7 +367,12 @@ impl InterfaceInner {
             IpPacket::Udp((_, udpv6_repr, payload)) => {
                 if self.use_sixlowpan_ghc {
                     // Here we calculate the size of the compressed packet.
-                    todo!();
+                    //todo!();
+                    let udp_repr = SixlowpanUdpGhcRepr(udpv6_repr);
+                    _compressed_headers_len += udp_repr.header_len();
+                    _uncompressed_headers_len += udpv6_repr.header_len();
+                    total_size += udp_repr.header_len() + udp_repr.compressed_payload_len(payload, &iphc_repr.src_addr, &iphc_repr.dst_addr);
+
                 } else {
                     let udp_repr = SixlowpanUdpNhcRepr(udpv6_repr);
                     _compressed_headers_len += udp_repr.header_len();
@@ -397,17 +428,35 @@ impl InterfaceInner {
                     #[cfg(feature = "socket-udp")]
                     IpPacket::Udp((_, udpv6_repr, payload)) => {
                         // TODO: check if we need to use GHC or not
-                        let udp_repr = SixlowpanUdpNhcRepr(udpv6_repr);
-                        let mut udp_packet = SixlowpanUdpNhcPacket::new_unchecked(
-                            &mut b[..udp_repr.header_len() + payload.len()],
-                        );
-                        udp_repr.emit(
-                            &mut udp_packet,
-                            &iphc_repr.src_addr,
-                            &iphc_repr.dst_addr,
-                            payload.len(),
-                            |buf| buf.copy_from_slice(payload),
-                        );
+                        // yes, because modified functions
+                        if self.use_sixlowpan_ghc {
+                            // todo!(); done
+                            let udp_repr = SixlowpanUdpGhcRepr(udpv6_repr);
+                            let mut udp_packet = SixlowpanUdpGhcPacket::new_unchecked(
+                                &mut b[..udp_repr.header_len() + udp_repr.compressed_payload_len(payload, &iphc_repr.src_addr, &iphc_repr.dst_addr)],
+                            );
+                            let mut rfc7400_comp_buffer = vec![0u8;48];
+                            rfc7400::dictionary_buffer_init(&mut rfc7400_comp_buffer, &iphc_repr.src_addr.as_bytes(),&iphc_repr.dst_addr.as_bytes());
+                            udp_repr.emit(
+                                &mut udp_packet,
+                                &iphc_repr.src_addr,
+                                &iphc_repr.dst_addr,
+                                udp_repr.compressed_payload_len(payload, &iphc_repr.src_addr, &iphc_repr.dst_addr),
+                                |buf| buf.copy_from_slice(&rfc7400::compress(&mut rfc7400_comp_buffer, &iphc_repr.src_addr.as_bytes(), &iphc_repr.dst_addr.as_bytes(), payload, payload.len())[..]),
+                            );
+                        } else {
+                            let udp_repr = SixlowpanUdpNhcRepr(udpv6_repr);
+                            let mut udp_packet = SixlowpanUdpNhcPacket::new_unchecked(
+                                &mut b[..udp_repr.header_len() + payload.len()],
+                            );
+                            udp_repr.emit(
+                                &mut udp_packet,
+                                &iphc_repr.src_addr,
+                                &iphc_repr.dst_addr,
+                                payload.len(),
+                                |buf| buf.copy_from_slice(payload),
+                            );
+                        }
                     }
                     #[cfg(feature = "socket-tcp")]
                     IpPacket::Tcp((_, tcp_repr)) => {
@@ -512,7 +561,20 @@ impl InterfaceInner {
                     #[cfg(feature = "socket-udp")]
                     IpPacket::Udp((_, udpv6_repr, payload)) => {
                         if self.use_sixlowpan_ghc {
-                            todo!();
+                            // todo!();
+                            let udp_repr = SixlowpanUdpGhcRepr(udpv6_repr);
+                            let mut udp_packet = SixlowpanUdpGhcPacket::new_unchecked(
+                                &mut tx_buf[..udp_repr.header_len() + udp_repr.compressed_payload_len(payload, &iphc_repr.src_addr, &iphc_repr.dst_addr)],
+                            );
+                            let mut rfc7400_comp_buffer = vec![0u8;48];
+                            rfc7400::dictionary_buffer_init(&mut rfc7400_comp_buffer, &iphc_repr.src_addr.as_bytes(),&iphc_repr.dst_addr.as_bytes());
+                            udp_repr.emit(
+                                &mut udp_packet,
+                                &iphc_repr.src_addr,
+                                &iphc_repr.dst_addr,
+                                udp_repr.compressed_payload_len(payload, &iphc_repr.src_addr, &iphc_repr.dst_addr),
+                                |buf| buf.copy_from_slice(&rfc7400::compress(&mut rfc7400_comp_buffer, &iphc_repr.src_addr.as_bytes(), &iphc_repr.dst_addr.as_bytes(), payload, payload.len())[..]),
+                            );
                         } else {
                             let udp_repr = SixlowpanUdpNhcRepr(udpv6_repr);
                             let mut udp_packet = SixlowpanUdpNhcPacket::new_unchecked(

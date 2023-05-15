@@ -175,6 +175,7 @@ const DISPATCH_FRAGMENT_HEADER: u8 = 0b11100;
 const DISPATCH_IPHC_HEADER: u8 = 0b011;
 const DISPATCH_UDP_HEADER: u8 = 0b11110;
 const DISPATCH_EXT_HEADER: u8 = 0b1110;
+const DISPATCH_UDP_GHC_HEADER: u8 = 0b11010;
 
 impl SixlowpanPacket {
     /// Returns the type of the 6LoWPAN header.
@@ -1395,7 +1396,7 @@ pub mod nhc {
     //! Implementation of Next Header Compression from [RFC 6282 § 4].
     //!
     //! [RFC 6282 § 4]: https://datatracker.ietf.org/doc/html/rfc6282#section-4
-    use super::{Error, NextHeader, Result, DISPATCH_EXT_HEADER, DISPATCH_UDP_HEADER};
+    use super::{Error, NextHeader, Result, DISPATCH_EXT_HEADER, DISPATCH_UDP_HEADER, DISPATCH_UDP_GHC_HEADER};
     use crate::{
         phy::ChecksumCapabilities,
         wire::{
@@ -1472,7 +1473,7 @@ pub mod nhc {
             } else if raw[0] >> 3 == DISPATCH_UDP_HEADER {
                 // We have a compressed UDP header.
                 Ok(Self::UdpHeader)
-            } else if raw[0] >> 3 == 0b11010 {
+            } else if raw[0] >> 3 == DISPATCH_UDP_GHC_HEADER {
                 // We have a UDP GHC packet
                 Ok(Self::UdpGhcHeader)
             } else {
@@ -2052,6 +2053,353 @@ pub mod nhc {
         }
     }
 
+    /// A read/write wrapper around a 6LoWPAN_GHC UDP frame.
+    /// [RFC 7400 § 3.1] specifies the format of the header.
+    ///
+    /// The base header has the following formath:
+    /// ```txt
+    ///   0   1   2   3   4   5   6   7
+    /// +---+---+---+---+---+---+---+---+
+    /// | 1 | 1 | 0 | 1 | 0 | C |   P   |
+    /// +---+---+---+---+---+---+---+---+
+    /// With:
+    /// - C: checksum, specifies if the checksum is elided.
+    /// - P: ports, specifies if the ports are elided.
+    /// ```
+    ///
+    /// [RFC 7400 § 3.1]: https://datatracker.ietf.org/doc/html/rfc7400#section-3.1
+    #[derive(Debug, Clone)]
+    #[cfg_attr(feature = "defmt", derive(defmt::Format))]
+    pub struct UdpGhcPacket<T: AsRef<[u8]>> {
+        buffer: T,
+    }
+
+    impl<T: AsRef<[u8]>> UdpGhcPacket<T> {
+        /// Input a raw octet buffer with a LOWPAN_GHC frame structure for UDP.
+        pub const fn new_unchecked(buffer: T) -> Self {
+            Self { buffer }
+        }
+
+        /// Shorthand for a combination of [new_unchecked] and [check_len].
+        ///
+        /// [new_unchecked]: #method.new_unchecked
+        /// [check_len]: #method.check_len
+        pub fn new_checked(buffer: T) -> Result<Self> {
+            let packet = Self::new_unchecked(buffer);
+            packet.check_len()?;
+            Ok(packet)
+        }
+
+        /// Ensure that no accessor method will panic if called.
+        /// Returns `Err(Error::Truncated)` if the buffer is too short.
+        pub fn check_len(&self) -> Result<()> {
+            let buffer = self.buffer.as_ref();
+
+            if buffer.is_empty() {
+                return Err(Error);
+            }
+
+            let index = 1 + self.ports_size() + self.checksum_size();
+            if index > buffer.len() {
+                return Err(Error);
+            }
+
+            Ok(())
+        }
+
+        /// Consumes the frame, returning the underlying buffer.
+        pub fn into_inner(self) -> T {
+            self.buffer
+        }
+
+        get_field!(dispatch_field, 0b11111, 3);
+        get_field!(checksum_field, 0b1, 2);
+        get_field!(ports_field, 0b11, 0);
+
+        /// Returns the index of the start of the next header compressed fields.
+        const fn ghc_fields_start(&self) -> usize {
+            1
+        }
+
+        /// Return the source port number.
+        pub fn src_port(&self) -> u16 {
+            match self.ports_field() {
+                0b00 | 0b01 => {
+                    // The full 16 bits are carried in-line.
+                    let data = self.buffer.as_ref();
+                    let start = self.ghc_fields_start();
+
+                    NetworkEndian::read_u16(&data[start..start + 2])
+                }
+                0b10 => {
+                    // The first 8 bits are elided.
+                    let data = self.buffer.as_ref();
+                    let start = self.ghc_fields_start();
+
+                    0xf000 + data[start] as u16
+                }
+                0b11 => {
+                    // The first 12 bits are elided.
+                    let data = self.buffer.as_ref();
+                    let start = self.ghc_fields_start();
+
+                    0xf0b0 + (data[start] >> 4) as u16
+                }
+                _ => unreachable!(),
+            }
+        }
+
+        /// Return the destination port number.
+        pub fn dst_port(&self) -> u16 {
+            match self.ports_field() {
+                0b00 => {
+                    // The full 16 bits are carried in-line.
+                    let data = self.buffer.as_ref();
+                    let idx = self.ghc_fields_start();
+
+                    NetworkEndian::read_u16(&data[idx + 2..idx + 4])
+                }
+                0b01 => {
+                    // The first 8 bits are elided.
+                    let data = self.buffer.as_ref();
+                    let idx = self.ghc_fields_start();
+
+                    0xf000 + data[idx] as u16
+                }
+                0b10 => {
+                    // The full 16 bits are carried in-line.
+                    let data = self.buffer.as_ref();
+                    let idx = self.ghc_fields_start();
+
+                    NetworkEndian::read_u16(&data[idx + 1..idx + 1 + 2])
+                }
+                0b11 => {
+                    // The first 12 bits are elided.
+                    let data = self.buffer.as_ref();
+                    let start = self.ghc_fields_start();
+
+                    0xf0b0 + (data[start] & 0xff) as u16
+                }
+                _ => unreachable!(),
+            }
+        }
+
+        /// Return the checksum.
+        pub fn checksum(&self) -> Option<u16> {
+            if self.checksum_field() == 0b0 {
+                // The first 12 bits are elided.
+                let data = self.buffer.as_ref();
+                let start = self.ghc_fields_start() + self.ports_size();
+                Some(NetworkEndian::read_u16(&data[start..start + 2]))
+            } else {
+                // The checksum is elided and needs to be recomputed on the 6LoWPAN termination point.
+                None
+            }
+        }
+
+        // Return the size of the checksum field.
+        pub(crate) fn checksum_size(&self) -> usize {
+            match self.checksum_field() {
+                0b0 => 2,
+                0b1 => 0,
+                _ => unreachable!(),
+            }
+        }
+
+        /// Returns the total size of both port numbers.
+        pub(crate) fn ports_size(&self) -> usize {
+            match self.ports_field() {
+                0b00 => 4, // 16 bits + 16 bits
+                0b01 => 3, // 16 bits + 8 bits
+                0b10 => 3, // 8 bits + 16 bits
+                0b11 => 1, // 4 bits + 4 bits
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    impl<'a, T: AsRef<[u8]> + ?Sized> UdpGhcPacket<&'a T> {
+        /// Return a pointer to the payload.
+        pub fn payload(&self) -> &'a [u8] {
+            let start = 1 + self.ports_size() + self.checksum_size();
+            &self.buffer.as_ref()[start..]
+        }
+    }
+
+    impl<T: AsRef<[u8]> + AsMut<[u8]>> UdpGhcPacket<T> {
+        /// Return a mutable pointer to the payload.
+        pub fn payload_mut(&mut self) -> &mut [u8] {
+            let start = 1 + self.ports_size() + 2; // XXX(thvdveld): we assume we put the checksum inlined.
+            &mut self.buffer.as_mut()[start..]
+        }
+
+        /// Set the dispatch field to `0b11010`.
+        fn set_dispatch_field(&mut self) {
+            let data = self.buffer.as_mut();
+            data[0] = (data[0] & !(0b11111 << 3)) | (DISPATCH_UDP_GHC_HEADER << 3);
+        }
+
+        set_field!(set_checksum_field, 0b1, 2);
+        set_field!(set_ports_field, 0b11, 0);
+
+        fn set_ports(&mut self, src_port: u16, dst_port: u16) {
+            let mut idx = 1;
+
+            match (src_port, dst_port) {
+                (0xf0b0..=0xf0bf, 0xf0b0..=0xf0bf) => {
+                    // We can compress both the source and destination ports.
+                    self.set_ports_field(0b11);
+                    let data = self.buffer.as_mut();
+                    data[idx] = (((src_port - 0xf0b0) as u8) << 4) & ((dst_port - 0xf0b0) as u8);
+                }
+                (0xf000..=0xf0ff, _) => {
+                    // We can compress the source port, but not the destination port.
+                    self.set_ports_field(0b10);
+                    let data = self.buffer.as_mut();
+                    data[idx] = (src_port - 0xf000) as u8;
+                    idx += 1;
+
+                    NetworkEndian::write_u16(&mut data[idx..idx + 2], dst_port);
+                }
+                (_, 0xf000..=0xf0ff) => {
+                    // We can compress the destination port, but not the source port.
+                    self.set_ports_field(0b01);
+                    let data = self.buffer.as_mut();
+                    NetworkEndian::write_u16(&mut data[idx..idx + 2], src_port);
+                    idx += 2;
+                    data[idx] = (dst_port - 0xf000) as u8;
+                }
+                (_, _) => {
+                    // We cannot compress any port.
+                    self.set_ports_field(0b00);
+                    let data = self.buffer.as_mut();
+                    NetworkEndian::write_u16(&mut data[idx..idx + 2], src_port);
+                    idx += 2;
+                    NetworkEndian::write_u16(&mut data[idx..idx + 2], dst_port);
+                }
+            };
+        }
+
+        fn set_checksum(&mut self, checksum: u16) {
+            self.set_checksum_field(0b0);
+            let idx = 1 + self.ports_size();
+            let data = self.buffer.as_mut();
+            NetworkEndian::write_u16(&mut data[idx..idx + 2], checksum);
+        }
+    }
+
+    /// A high-level representation of a 6LoWPAN GHC UDP header.
+    #[derive(Debug, PartialEq, Eq, Clone, Copy)]
+    #[cfg_attr(feature = "defmt", derive(defmt::Format))]
+    pub struct UdpGhcRepr(pub UdpRepr);
+
+    impl<'a> UdpGhcRepr {
+        /// Parse a 6LoWPAN GHC UDP packet and return a high-level representation.
+        pub fn parse<T: AsRef<[u8]> + ?Sized>(
+            packet: &UdpGhcPacket<&'a T>,
+            src_addr: &ipv6::Address,
+            dst_addr: &ipv6::Address,
+            checksum_caps: &ChecksumCapabilities,
+        ) -> Result<Self> {
+            packet.check_len()?;
+
+            if packet.dispatch_field() != DISPATCH_UDP_GHC_HEADER {
+                return Err(Error);
+            }
+
+            if checksum_caps.udp.rx() {
+                let payload_len = packet.payload().len();
+                let chk_sum = !checksum::combine(&[
+                    checksum::pseudo_header(
+                        &IpAddress::Ipv6(*src_addr),
+                        &IpAddress::Ipv6(*dst_addr),
+                        crate::wire::ip::Protocol::Udp,
+                        payload_len as u32 + 8,
+                    ),
+                    packet.src_port(),
+                    packet.dst_port(),
+                    payload_len as u16 + 8,
+                    checksum::data(packet.payload()),
+                ]);
+
+                if let Some(checksum) = packet.checksum() {
+                    if chk_sum != checksum {
+                        return Err(Error);
+                    }
+                }
+            }
+
+            Ok(Self(UdpRepr {
+                src_port: packet.src_port(),
+                dst_port: packet.dst_port(),
+            }))
+        }
+
+        /// Return the length of a packet that will be emitted from this high-level representation.
+        pub fn header_len(&self) -> usize {
+            let mut len = 1; // The minimal header size
+
+            len += 2; // XXX We assume we will add the checksum at the end
+
+            // Check if we can compress the source and destination ports
+            match (self.src_port, self.dst_port) {
+                (0xf0b0..=0xf0bf, 0xf0b0..=0xf0bf) => len + 1,
+                (0xf000..=0xf0ff, _) | (_, 0xf000..=0xf0ff) => len + 3,
+                (_, _) => len + 4,
+            }
+        }
+
+        pub fn compressed_payload_len(&self, payload: &[u8], src_addr: &Address, dst_addr: &Address) -> usize {
+            let mut rfc7400_comp_buffer = vec![0u8;48];
+            rfc7400::dictionary_buffer_init(&mut rfc7400_comp_buffer, src_addr.as_bytes(), dst_addr.as_bytes());
+            let compressed_payload = rfc7400::compress(&mut rfc7400_comp_buffer, src_addr.as_bytes(), dst_addr.as_bytes(), payload, payload.len());
+            compressed_payload.len()
+        }
+
+        /// Emit a high-level representation into a LOWPAN_GHC UDP header.
+        pub fn emit<T: AsRef<[u8]> + AsMut<[u8]>>(
+            &self,
+            packet: &mut UdpGhcPacket<T>,
+            src_addr: &Address,
+            dst_addr: &Address,
+            payload_len: usize,
+            emit_payload: impl FnOnce(&mut [u8]),
+        ) {
+            packet.set_dispatch_field();
+            packet.set_ports(self.src_port, self.dst_port);
+            emit_payload(packet.payload_mut());
+
+            let chk_sum = !checksum::combine(&[
+                checksum::pseudo_header(
+                    &IpAddress::Ipv6(*src_addr),
+                    &IpAddress::Ipv6(*dst_addr),
+                    crate::wire::ip::Protocol::Udp,
+                    payload_len as u32 + 8,
+                ),
+                self.src_port,
+                self.dst_port,
+                payload_len as u16 + 8,
+                checksum::data(packet.payload_mut()),
+            ]);
+
+            packet.set_checksum(chk_sum);
+        }
+    }
+
+    impl core::ops::Deref for UdpGhcRepr {
+        type Target = UdpRepr;
+
+        fn deref(&self) -> &Self::Target {
+            &self.0
+        }
+    }
+
+    impl core::ops::DerefMut for UdpGhcRepr {
+        fn deref_mut(&mut self) -> &mut Self::Target {
+            &mut self.0
+        }
+    }
+
     #[cfg(test)]
     mod test {
         use super::*;
@@ -2120,6 +2468,46 @@ pub mod nhc {
             assert_eq!(packet.src_port(), 0xf0b1);
             assert_eq!(packet.dst_port(), 0xf001);
             assert_eq!(packet.payload_mut(), b"Hello World!");
+        }
+
+        #[test]
+        fn udp_ghc_fields() {
+            let bytes = [0xd0, 0x16, 0x2e, 0x22, 0x3d, 0x28, 0xc4];
+
+            let packet = UdpGhcPacket::new_checked(&bytes[..]).unwrap();
+            assert_eq!(packet.dispatch_field(), DISPATCH_UDP_GHC_HEADER);
+            assert_eq!(packet.checksum(), Some(0x28c4));
+            assert_eq!(packet.src_port(), 5678);
+            assert_eq!(packet.dst_port(), 8765);
+        }
+
+        #[test]
+        fn udp_ghc_emit() {
+            let udp = UdpGhcRepr(UdpRepr {
+                src_port: 0xf0b1,
+                dst_port: 0xf001,
+            });
+
+            let payload = b"Hello World!";
+
+            let src_addr = ipv6::Address::default();
+            let dst_addr = ipv6::Address::default();
+
+            let len = udp.header_len() + udp.compressed_payload_len(payload, &src_addr, &dst_addr);
+            let mut buffer = [0u8; 127];
+            let mut packet = UdpGhcPacket::new_unchecked(&mut buffer[..len]);
+
+            let mut rfc7400_comp_buffer = vec![0u8;48];
+            rfc7400::dictionary_buffer_init(&mut rfc7400_comp_buffer, &src_addr.as_bytes(), &dst_addr.as_bytes());
+
+            udp.emit(&mut packet, &src_addr, &dst_addr, udp.compressed_payload_len(payload, &src_addr, &dst_addr), |buf| {
+                buf.copy_from_slice(&rfc7400::compress(&mut rfc7400_comp_buffer, &src_addr.as_bytes(), &dst_addr.as_bytes(), payload, payload.len())[..])
+            });
+
+            assert_eq!(packet.dispatch_field(), DISPATCH_UDP_GHC_HEADER);
+            assert_eq!(packet.src_port(), 0xf0b1);
+            assert_eq!(packet.dst_port(), 0xf001);
+            assert_eq!(packet.payload_mut(), rfc7400::compress(&mut rfc7400_comp_buffer, &src_addr.as_bytes(), &dst_addr.as_bytes(), payload, payload.len()));
         }
     }
 }
