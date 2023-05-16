@@ -196,7 +196,10 @@ impl InterfaceInner {
                     SixlowpanNhcPacket::UdpGhcHeader => {
                         // Here we calculate the size of the uncompressed UDP-GHC packet.
                         // todo!(); done
+
+
                         let udp_packet = SixlowpanUdpGhcPacket::new_checked(iphc.payload())?;
+
                         let udp_repr = SixlowpanUdpGhcRepr::parse(
                             &udp_packet,
                             &iphc_repr.src_addr,
@@ -263,8 +266,9 @@ impl InterfaceInner {
                     }
                     SixlowpanNhcPacket::UdpGhcHeader => {
                         // Here we decompress the packet into the buffer.
-                        // todo!(); done
+                        // todo!();
                         let udp_packet = SixlowpanUdpGhcPacket::new_checked(iphc.payload())?;
+
                         let udp_repr = SixlowpanUdpGhcRepr::parse(
                             &udp_packet,
                             &iphc_repr.src_addr,
@@ -278,7 +282,9 @@ impl InterfaceInner {
                         );
                         udp_repr.0.emit_header(&mut udp, ipv6_repr.payload_len - 8);
 
-                        buffer[8..].copy_from_slice(&iphc.payload()[udp_repr.header_len()..]);
+                        let mut rfc7400_decom_buffer = vec![0u8;48];
+
+                        buffer[8..].copy_from_slice(&rfc7400::decompress(&mut rfc7400_decom_buffer, ipv6_repr.src_addr.as_bytes(), ipv6_repr.dst_addr.as_bytes(),&iphc.payload()[udp_repr.header_len()..],iphc.payload()[udp_repr.header_len()..].len()));
                     }
                 }
             }
