@@ -195,9 +195,6 @@ impl InterfaceInner {
                     }
                     SixlowpanNhcPacket::UdpGhcHeader => {
                         // Here we calculate the size of the uncompressed UDP-GHC packet.
-                        // todo!(); done
-
-
                         let udp_packet = SixlowpanUdpGhcPacket::new_checked(iphc.payload())?;
 
                         let udp_repr = SixlowpanUdpGhcRepr::parse(
@@ -266,7 +263,6 @@ impl InterfaceInner {
                     }
                     SixlowpanNhcPacket::UdpGhcHeader => {
                         // Here we decompress the packet into the buffer.
-                        // todo!();
                         let udp_packet = SixlowpanUdpGhcPacket::new_checked(iphc.payload())?;
 
                         let udp_repr = SixlowpanUdpGhcRepr::parse(
@@ -373,7 +369,6 @@ impl InterfaceInner {
             IpPacket::Udp((_, udpv6_repr, payload)) => {
                 if self.use_sixlowpan_ghc {
                     // Here we calculate the size of the compressed packet.
-                    //todo!();
                     let udp_repr = SixlowpanUdpGhcRepr(udpv6_repr);
                     _compressed_headers_len += udp_repr.header_len();
                     _uncompressed_headers_len += udpv6_repr.header_len();
@@ -433,10 +428,7 @@ impl InterfaceInner {
                 match packet {
                     #[cfg(feature = "socket-udp")]
                     IpPacket::Udp((_, udpv6_repr, payload)) => {
-                        // TODO: check if we need to use GHC or not
-                        // yes, because modified functions
                         if self.use_sixlowpan_ghc {
-                            // todo!(); done
                             let udp_repr = SixlowpanUdpGhcRepr(udpv6_repr);
                             let mut udp_packet = SixlowpanUdpGhcPacket::new_unchecked(
                                 &mut b[..udp_repr.header_len() + udp_repr.compressed_payload_len(payload, &iphc_repr.src_addr, &iphc_repr.dst_addr)],
@@ -567,7 +559,6 @@ impl InterfaceInner {
                     #[cfg(feature = "socket-udp")]
                     IpPacket::Udp((_, udpv6_repr, payload)) => {
                         if self.use_sixlowpan_ghc {
-                            // todo!();
                             let udp_repr = SixlowpanUdpGhcRepr(udpv6_repr);
                             let mut udp_packet = SixlowpanUdpGhcPacket::new_unchecked(
                                 &mut tx_buf[..udp_repr.header_len() + udp_repr.compressed_payload_len(payload, &iphc_repr.src_addr, &iphc_repr.dst_addr)],
