@@ -176,6 +176,7 @@ const DISPATCH_IPHC_HEADER: u8 = 0b011;
 const DISPATCH_UDP_HEADER: u8 = 0b11110;
 const DISPATCH_EXT_HEADER: u8 = 0b1110;
 const DISPATCH_UDP_GHC_HEADER: u8 = 0b11010;
+const DISPATCH_ICMP_GHC_HEADER: u8 = 0b11011111;
 
 impl SixlowpanPacket {
     /// Returns the type of the 6LoWPAN header.
@@ -1396,7 +1397,7 @@ pub mod nhc {
     //! Implementation of Next Header Compression from [RFC 6282 § 4].
     //!
     //! [RFC 6282 § 4]: https://datatracker.ietf.org/doc/html/rfc6282#section-4
-    use super::{Error, NextHeader, Result, DISPATCH_EXT_HEADER, DISPATCH_UDP_HEADER, DISPATCH_UDP_GHC_HEADER};
+    use super::{Error, NextHeader, Result, DISPATCH_EXT_HEADER, DISPATCH_UDP_HEADER, DISPATCH_UDP_GHC_HEADER, DISPATCH_ICMP_GHC_HEADER};
     use crate::{
         phy::ChecksumCapabilities,
         wire::{
@@ -1451,7 +1452,8 @@ pub mod nhc {
     pub enum NhcPacket {
         ExtHeader,
         UdpHeader,
-        UdpGhcHeader
+        UdpGhcHeader,
+        ICMPGhcHeader
     }
 
     impl NhcPacket {
@@ -1476,6 +1478,9 @@ pub mod nhc {
             } else if raw[0] >> 3 == DISPATCH_UDP_GHC_HEADER {
                 // We have a UDP GHC packet
                 Ok(Self::UdpGhcHeader)
+            } else if raw[0] == DISPATCH_ICMP_GHC_HEADER {
+                // We have a ICMP GHC packet
+                Ok(Self::ICMPGhcHeader)
             } else {
                 Err(Error)
             }
@@ -2397,6 +2402,630 @@ pub mod nhc {
     impl core::ops::DerefMut for UdpGhcRepr {
         fn deref_mut(&mut self) -> &mut Self::Target {
             &mut self.0
+        }
+    }
+
+    use core::cmp;
+    use crate::wire::MldRepr;
+    #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
+    use crate::wire::NdiscRepr;
+    use crate::wire::{Ipv6Packet, Ipv6Repr};
+    use crate::wire::icmpv6::Message;
+
+    enum_with_unknown! {
+    /// Internet protocol control message subtype for type "Destination Unreachable".
+    pub enum DstUnreachable(u8) {
+        /// No Route to destination.
+        NoRoute         = 0,
+        /// Communication with destination administratively prohibited.
+        AdminProhibit   = 1,
+        /// Beyond scope of source address.
+        BeyondScope     = 2,
+        /// Address unreachable.
+        AddrUnreachable = 3,
+        /// Port unreachable.
+        PortUnreachable = 4,
+        /// Source address failed ingress/egress policy.
+        FailedPolicy    = 5,
+        /// Reject route to destination.
+        RejectRoute     = 6
+    }
+}
+
+    enum_with_unknown! {
+    /// Internet protocol control message subtype for the type "Parameter Problem".
+    pub enum ParamProblem(u8) {
+        /// Erroneous header field encountered.
+        ErroneousHdrField  = 0,
+        /// Unrecognized Next Header type encountered.
+        UnrecognizedNxtHdr = 1,
+        /// Unrecognized IPv6 option encountered.
+        UnrecognizedOption = 2
+    }
+}
+
+    enum_with_unknown! {
+    /// Internet protocol control message subtype for the type "Time Exceeded".
+    pub enum TimeExceeded(u8) {
+        /// Hop limit exceeded in transit.
+        HopLimitExceeded    = 0,
+        /// Fragment reassembly time exceeded.
+        FragReassemExceeded = 1
+    }
+}
+
+    /// A read/write wrapper around a 6LoWPAN_GHC ICMPv6 frame.
+    /// [RFC 7400 § 3.1] specifies the format of the header.
+    ///
+    /// The base header has the following formath:
+    /// ```txt
+    ///   0   1   2   3   4   5   6   7
+    /// +---+---+---+---+---+---+---+---+
+    /// | 1 | 1 | 0 | 1 | 1 | 1 | 1 | 1 |
+    /// +---+---+---+---+---+---+---+---+`
+    ///
+    /// [RFC 7400 § 3.1]: https://datatracker.ietf.org/doc/html/rfc7400#section-3.1
+    #[derive(Debug, Clone)]
+    #[cfg_attr(feature = "defmt", derive(defmt::Format))]
+    pub struct ICMPGhcPacket<T: AsRef<[u8]>> {
+        pub(super) buffer: T,
+    }
+
+    pub(super) mod field {
+        use crate::wire::field::*;
+
+        // ICMPv6: See https://tools.ietf.org/html/rfc4443
+        pub const TYPE: usize = 0;
+        pub const CODE: usize = 1;
+        pub const CHECKSUM: Field = 2..4;
+
+        pub const UNUSED: Field = 4..8;
+        pub const MTU: Field = 4..8;
+        pub const POINTER: Field = 4..8;
+        pub const ECHO_IDENT: Field = 4..6;
+        pub const ECHO_SEQNO: Field = 6..8;
+
+        pub const HEADER_END: usize = 8;
+
+        // NDISC: See https://tools.ietf.org/html/rfc4861
+        // Router Advertisement message offsets
+        pub const CUR_HOP_LIMIT: usize = 4;
+        pub const ROUTER_FLAGS: usize = 5;
+        pub const ROUTER_LT: Field = 6..8;
+        pub const REACHABLE_TM: Field = 8..12;
+        pub const RETRANS_TM: Field = 12..16;
+
+        // Neighbor Solicitation message offsets
+        pub const TARGET_ADDR: Field = 8..24;
+
+        // Neighbor Advertisement message offsets
+        pub const NEIGH_FLAGS: usize = 4;
+
+        // Redirected Header message offsets
+        pub const DEST_ADDR: Field = 24..40;
+
+        // MLD:
+        //   - https://tools.ietf.org/html/rfc3810
+        //   - https://tools.ietf.org/html/rfc3810
+        // Multicast Listener Query message
+        pub const MAX_RESP_CODE: Field = 4..6;
+        pub const QUERY_RESV: Field = 6..8;
+        pub const QUERY_MCAST_ADDR: Field = 8..24;
+        pub const SQRV: usize = 24;
+        pub const QQIC: usize = 25;
+        pub const QUERY_NUM_SRCS: Field = 26..28;
+
+        // Multicast Listener Report Message
+        pub const RECORD_RESV: Field = 4..6;
+        pub const NR_MCAST_RCRDS: Field = 6..8;
+
+        // Multicast Address Record Offsets
+        pub const RECORD_TYPE: usize = 0;
+        pub const AUX_DATA_LEN: usize = 1;
+        pub const RECORD_NUM_SRCS: Field = 2..4;
+        pub const RECORD_MCAST_ADDR: Field = 4..20;
+    }
+
+    impl<T: AsRef<[u8]>> ICMPGhcPacket<T> {
+
+        /// Input a raw octet buffer with a LOWPAN_GHC frame structure for UDP.
+        pub const fn new_unchecked(buffer: T) -> Self {
+            Self { buffer }
+        }
+
+        /// Shorthand for a combination of [new_unchecked] and [check_len].
+        ///
+        /// [new_unchecked]: #method.new_unchecked
+        /// [check_len]: #method.check_len
+        pub fn new_checked(buffer: T) -> Result<Self> {
+            let packet = Self::new_unchecked(buffer);
+            packet.check_len()?;
+            Ok(packet)
+        }
+
+        /// Ensure that no accessor method will panic if called.
+        /// Returns `Err(Error)` if the buffer is too short.
+        pub fn check_len(&self) -> Result<()> {
+            let len = self.buffer.as_ref().len();
+            if len < field::HEADER_END || len < self.header_len() {
+                Err(Error)
+            } else {
+                Ok(())
+            }
+        }
+
+        /// Consumes the frame, returning the underlying buffer.
+        pub fn into_inner(self) -> T {
+            self.buffer
+        }
+
+        /// Return the message type field.
+        #[inline]
+        pub fn msg_type(&self) -> Message {
+            let data = self.buffer.as_ref();
+            Message::from(data[field::TYPE])
+        }
+
+        /// Return the message code field.
+        #[inline]
+        pub fn msg_code(&self) -> u8 {
+            let data = self.buffer.as_ref();
+            data[field::CODE]
+        }
+
+        /// Return the checksum field.
+        #[inline]
+        pub fn checksum(&self) -> u16 {
+            let data = self.buffer.as_ref();
+            NetworkEndian::read_u16(&data[field::CHECKSUM])
+        }
+
+        /// Return the identifier field (for echo request and reply packets).
+        #[inline]
+        pub fn echo_ident(&self) -> u16 {
+            let data = self.buffer.as_ref();
+            NetworkEndian::read_u16(&data[field::ECHO_IDENT])
+        }
+
+        /// Return the sequence number field (for echo request and reply packets).
+        #[inline]
+        pub fn echo_seq_no(&self) -> u16 {
+            let data = self.buffer.as_ref();
+            NetworkEndian::read_u16(&data[field::ECHO_SEQNO])
+        }
+
+        /// Return the MTU field (for packet too big messages).
+        #[inline]
+        pub fn pkt_too_big_mtu(&self) -> u32 {
+            let data = self.buffer.as_ref();
+            NetworkEndian::read_u32(&data[field::MTU])
+        }
+
+        /// Return the pointer field (for parameter problem messages).
+        #[inline]
+        pub fn param_problem_ptr(&self) -> u32 {
+            let data = self.buffer.as_ref();
+            NetworkEndian::read_u32(&data[field::POINTER])
+        }
+
+        /// Return the header length. The result depends on the value of
+        /// the message type field.
+        pub fn header_len(&self) -> usize {
+            match self.msg_type() {
+                Message::DstUnreachable => field::UNUSED.end,
+                Message::PktTooBig => field::MTU.end,
+                Message::TimeExceeded => field::UNUSED.end,
+                Message::ParamProblem => field::POINTER.end,
+                Message::EchoRequest => field::ECHO_SEQNO.end,
+                Message::EchoReply => field::ECHO_SEQNO.end,
+                Message::RouterSolicit => field::UNUSED.end,
+                Message::RouterAdvert => field::RETRANS_TM.end,
+                Message::NeighborSolicit => field::TARGET_ADDR.end,
+                Message::NeighborAdvert => field::TARGET_ADDR.end,
+                Message::Redirect => field::DEST_ADDR.end,
+                Message::MldQuery => field::QUERY_NUM_SRCS.end,
+                Message::MldReport => field::NR_MCAST_RCRDS.end,
+                // For packets that are not included in RFC 4443, do not
+                // include the last 32 bits of the ICMPv6 header in
+                // `header_bytes`. This must be done so that these bytes
+                // can be accessed in the `payload`.
+                _ => field::CHECKSUM.end,
+            }
+        }
+
+        /// Validate the header checksum.
+        ///
+        /// # Fuzzing
+        /// This function always returns `true` when fuzzing.
+        pub fn verify_checksum(&self, src_addr: &IpAddress, dst_addr: &IpAddress) -> bool {
+            if cfg!(fuzzing) {
+                return true;
+            }
+
+            let data = self.buffer.as_ref();
+            checksum::combine(&[
+                checksum::pseudo_header(src_addr, dst_addr, IpProtocol::Icmpv6, data.len() as u32),
+                checksum::data(data),
+            ]) == !0
+        }
+    }
+
+    impl<'a, T: AsRef<[u8]> + ?Sized> ICMPGhcPacket<&'a T> {
+        /// Return a pointer to the type-specific data.
+        #[inline]
+        pub fn payload(&self) -> &'a [u8] {
+            let data = self.buffer.as_ref();
+            &data[self.header_len()..]
+        }
+    }
+
+    impl<T: AsRef<[u8]> + AsMut<[u8]>> ICMPGhcPacket<T> {
+        /// Set the message type field.
+        #[inline]
+        pub fn set_msg_type(&mut self, value: Message) {
+            let data = self.buffer.as_mut();
+            data[field::TYPE] = value.into()
+        }
+
+        /// Set the message code field.
+        #[inline]
+        pub fn set_msg_code(&mut self, value: u8) {
+            let data = self.buffer.as_mut();
+            data[field::CODE] = value
+        }
+
+        /// Clear any reserved fields in the message header.
+        ///
+        /// # Panics
+        /// This function panics if the message type has not been set.
+        /// See [set_msg_type].
+        ///
+        /// [set_msg_type]: #method.set_msg_type
+        #[inline]
+        pub fn clear_reserved(&mut self) {
+            match self.msg_type() {
+                Message::RouterSolicit
+                | Message::NeighborSolicit
+                | Message::NeighborAdvert
+                | Message::Redirect => {
+                    let data = self.buffer.as_mut();
+                    NetworkEndian::write_u32(&mut data[field::UNUSED], 0);
+                }
+                Message::MldQuery => {
+                    let data = self.buffer.as_mut();
+                    NetworkEndian::write_u16(&mut data[field::QUERY_RESV], 0);
+                    data[field::SQRV] &= 0xf;
+                }
+                Message::MldReport => {
+                    let data = self.buffer.as_mut();
+                    NetworkEndian::write_u16(&mut data[field::RECORD_RESV], 0);
+                }
+                ty => panic!("Message type `{ty}` does not have any reserved fields."),
+            }
+        }
+
+        #[inline]
+        pub fn set_checksum(&mut self, value: u16) {
+            let data = self.buffer.as_mut();
+            NetworkEndian::write_u16(&mut data[field::CHECKSUM], value)
+        }
+
+        /// Set the identifier field (for echo request and reply packets).
+        ///
+        /// # Panics
+        /// This function may panic if this packet is not an echo request or reply packet.
+        #[inline]
+        pub fn set_echo_ident(&mut self, value: u16) {
+            let data = self.buffer.as_mut();
+            NetworkEndian::write_u16(&mut data[field::ECHO_IDENT], value)
+        }
+
+        /// Set the sequence number field (for echo request and reply packets).
+        ///
+        /// # Panics
+        /// This function may panic if this packet is not an echo request or reply packet.
+        #[inline]
+        pub fn set_echo_seq_no(&mut self, value: u16) {
+            let data = self.buffer.as_mut();
+            NetworkEndian::write_u16(&mut data[field::ECHO_SEQNO], value)
+        }
+
+        /// Set the MTU field (for packet too big messages).
+        ///
+        /// # Panics
+        /// This function may panic if this packet is not an packet too big packet.
+        #[inline]
+        pub fn set_pkt_too_big_mtu(&mut self, value: u32) {
+            let data = self.buffer.as_mut();
+            NetworkEndian::write_u32(&mut data[field::MTU], value)
+        }
+
+        /// Set the pointer field (for parameter problem messages).
+        ///
+        /// # Panics
+        /// This function may panic if this packet is not a parameter problem message.
+        #[inline]
+        pub fn set_param_problem_ptr(&mut self, value: u32) {
+            let data = self.buffer.as_mut();
+            NetworkEndian::write_u32(&mut data[field::POINTER], value)
+        }
+
+        /// Compute and fill in the header checksum.
+        pub fn fill_checksum(&mut self, src_addr: &IpAddress, dst_addr: &IpAddress) {
+            self.set_checksum(0);
+            let checksum = {
+                let data = self.buffer.as_ref();
+                !checksum::combine(&[
+                    checksum::pseudo_header(src_addr, dst_addr, IpProtocol::Icmpv6, data.len() as u32),
+                    checksum::data(data),
+                ])
+            };
+            self.set_checksum(checksum)
+        }
+
+        /// Return a mutable pointer to the type-specific data.
+        #[inline]
+        pub fn payload_mut(&mut self) -> &mut [u8] {
+            let range = self.header_len()..;
+            let data = self.buffer.as_mut();
+            &mut data[range]
+        }
+    }
+
+    impl<T: AsRef<[u8]>> AsRef<[u8]> for ICMPGhcPacket<T> {
+        fn as_ref(&self) -> &[u8] {
+            self.buffer.as_ref()
+        }
+    }
+
+    /// A high-level representation of an GHC Internet Control Message Protocol version 6 packet header.
+    #[derive(Debug, PartialEq, Eq, Clone, Copy)]
+    #[cfg_attr(feature = "defmt", derive(defmt::Format))]
+    #[non_exhaustive]
+    pub enum ICMPGhcRepr<'a> {
+        DstUnreachable {
+            reason: DstUnreachable,
+            header: Ipv6Repr,
+            data: &'a [u8],
+        },
+        PktTooBig {
+            mtu: u32,
+            header: Ipv6Repr,
+            data: &'a [u8],
+        },
+        TimeExceeded {
+            reason: TimeExceeded,
+            header: Ipv6Repr,
+            data: &'a [u8],
+        },
+        ParamProblem {
+            reason: ParamProblem,
+            pointer: u32,
+            header: Ipv6Repr,
+            data: &'a [u8],
+        },
+        EchoRequest {
+            ident: u16,
+            seq_no: u16,
+            data: &'a [u8],
+        },
+        EchoReply {
+            ident: u16,
+            seq_no: u16,
+            data: &'a [u8],
+        },
+        #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
+        Ndisc(NdiscRepr<'a>),
+        Mld(MldRepr<'a>),
+    }
+
+    use crate::wire::icmpv6::Packet;
+
+    impl<'a> ICMPGhcRepr<'a> {
+        /// Parse an Internet Control Message Protocol version 6 packet and return
+        /// a high-level representation..
+        pub fn parse<T>(
+            src_addr: &IpAddress,
+            dst_addr: &IpAddress,
+            packet: &Packet<&'a T>,
+            checksum_caps: &ChecksumCapabilities,
+        ) -> Result<ICMPGhcRepr<'a>>
+            where
+                T: AsRef<[u8]> + ?Sized,
+        {
+            fn create_packet_from_payload<'a, T>(packet: &Packet<&'a T>) -> Result<(&'a [u8], Ipv6Repr)>
+                where
+                    T: AsRef<[u8]> + ?Sized,
+            {
+                let ip_packet = Ipv6Packet::new_checked(packet.payload())?;
+
+                let payload = &packet.payload()[ip_packet.header_len()..];
+                if payload.len() < 8 {
+                    return Err(Error);
+                }
+                let repr = Ipv6Repr {
+                    src_addr: ip_packet.src_addr(),
+                    dst_addr: ip_packet.dst_addr(),
+                    next_header: ip_packet.next_header(),
+                    payload_len: payload.len(),
+                    hop_limit: ip_packet.hop_limit(),
+                };
+                Ok((payload, repr))
+            }
+            // Valid checksum is expected.
+            if checksum_caps.icmpv6.rx() && !packet.verify_checksum(src_addr, dst_addr) {
+                return Err(Error);
+            }
+
+            match (packet.msg_type(), packet.msg_code()) {
+                (Message::DstUnreachable, code) => {
+                    let (payload, repr) = create_packet_from_payload(packet)?;
+                    Ok(ICMPGhcRepr::DstUnreachable {
+                        reason: DstUnreachable::from(code),
+                        header: repr,
+                        data: payload,
+                    })
+                }
+                (Message::PktTooBig, 0) => {
+                    let (payload, repr) = create_packet_from_payload(packet)?;
+                    Ok(ICMPGhcRepr::PktTooBig {
+                        mtu: packet.pkt_too_big_mtu(),
+                        header: repr,
+                        data: payload,
+                    })
+                }
+                (Message::TimeExceeded, code) => {
+                    let (payload, repr) = create_packet_from_payload(packet)?;
+                    Ok(ICMPGhcRepr::TimeExceeded {
+                        reason: TimeExceeded::from(code),
+                        header: repr,
+                        data: payload,
+                    })
+                }
+                (Message::ParamProblem, code) => {
+                    let (payload, repr) = create_packet_from_payload(packet)?;
+                    Ok(ICMPGhcRepr::ParamProblem {
+                        reason: ParamProblem::from(code),
+                        pointer: packet.param_problem_ptr(),
+                        header: repr,
+                        data: payload,
+                    })
+                }
+                (Message::EchoRequest, 0) => Ok(ICMPGhcRepr::EchoRequest {
+                    ident: packet.echo_ident(),
+                    seq_no: packet.echo_seq_no(),
+                    data: packet.payload(),
+                }),
+                (Message::EchoReply, 0) => Ok(ICMPGhcRepr::EchoReply {
+                    ident: packet.echo_ident(),
+                    seq_no: packet.echo_seq_no(),
+                    data: packet.payload(),
+                }),
+                #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
+                (msg_type, 0) if msg_type.is_ndisc() => NdiscRepr::parse(packet).map(ICMPGhcRepr::Ndisc),
+                (msg_type, 0) if msg_type.is_mld() => MldRepr::parse(packet).map(ICMPGhcRepr::Mld),
+                _ => Err(Error),
+            }
+        }
+
+        /// Return the length of a packet that will be emitted from this high-level representation.
+        pub const fn buffer_len(&self) -> usize {
+            match self {
+                &ICMPGhcRepr::DstUnreachable { header, data, .. }
+                | &ICMPGhcRepr::PktTooBig { header, data, .. }
+                | &ICMPGhcRepr::TimeExceeded { header, data, .. }
+                | &ICMPGhcRepr::ParamProblem { header, data, .. } => {
+                    field::UNUSED.end + header.buffer_len() + data.len()
+                }
+                &ICMPGhcRepr::EchoRequest { data, .. } | &ICMPGhcRepr::EchoReply { data, .. } => {
+                    field::ECHO_SEQNO.end + data.len()
+                }
+                #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
+                &ICMPGhcRepr::Ndisc(ndisc) => ndisc.buffer_len(),
+                &ICMPGhcRepr::Mld(mld) => mld.buffer_len(),
+            }
+        }
+
+        /// Emit a high-level representation into an Internet Control Message Protocol version 6
+        /// packet.
+        pub fn emit<T>(
+            &self,
+            src_addr: &IpAddress,
+            dst_addr: &IpAddress,
+            packet: &mut Packet<&mut T>,
+            checksum_caps: &ChecksumCapabilities,
+        ) where
+            T: AsRef<[u8]> + AsMut<[u8]> + ?Sized,
+        {
+            fn emit_contained_packet(buffer: &mut [u8], header: Ipv6Repr, data: &[u8]) {
+                let mut ip_packet = Ipv6Packet::new_unchecked(buffer);
+                header.emit(&mut ip_packet);
+                let payload = &mut ip_packet.into_inner()[header.buffer_len()..];
+                payload.copy_from_slice(data);
+            }
+
+            match *self {
+                ICMPGhcRepr::DstUnreachable {
+                    reason,
+                    header,
+                    data,
+                } => {
+                    packet.set_msg_type(Message::DstUnreachable);
+                    packet.set_msg_code(reason.into());
+
+                    emit_contained_packet(packet.payload_mut(), header, data);
+                }
+
+                ICMPGhcRepr::PktTooBig { mtu, header, data } => {
+                    packet.set_msg_type(Message::PktTooBig);
+                    packet.set_msg_code(0);
+                    packet.set_pkt_too_big_mtu(mtu);
+
+                    emit_contained_packet(packet.payload_mut(), header, data);
+                }
+
+                ICMPGhcRepr::TimeExceeded {
+                    reason,
+                    header,
+                    data,
+                } => {
+                    packet.set_msg_type(Message::TimeExceeded);
+                    packet.set_msg_code(reason.into());
+
+                    emit_contained_packet(packet.payload_mut(), header, data);
+                }
+
+                ICMPGhcRepr::ParamProblem {
+                    reason,
+                    pointer,
+                    header,
+                    data,
+                } => {
+                    packet.set_msg_type(Message::ParamProblem);
+                    packet.set_msg_code(reason.into());
+                    packet.set_param_problem_ptr(pointer);
+
+                    emit_contained_packet(packet.payload_mut(), header, data);
+                }
+
+                ICMPGhcRepr::EchoRequest {
+                    ident,
+                    seq_no,
+                    data,
+                } => {
+                    packet.set_msg_type(Message::EchoRequest);
+                    packet.set_msg_code(0);
+                    packet.set_echo_ident(ident);
+                    packet.set_echo_seq_no(seq_no);
+                    let data_len = cmp::min(packet.payload_mut().len(), data.len());
+                    packet.payload_mut()[..data_len].copy_from_slice(&data[..data_len])
+                }
+
+                ICMPGhcRepr::EchoReply {
+                    ident,
+                    seq_no,
+                    data,
+                } => {
+                    packet.set_msg_type(Message::EchoReply);
+                    packet.set_msg_code(0);
+                    packet.set_echo_ident(ident);
+                    packet.set_echo_seq_no(seq_no);
+                    let data_len = cmp::min(packet.payload_mut().len(), data.len());
+                    packet.payload_mut()[..data_len].copy_from_slice(&data[..data_len])
+                }
+
+                #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
+                ICMPGhcRepr::Ndisc(ndisc) => ndisc.emit(packet),
+
+                ICMPGhcRepr::Mld(mld) => mld.emit(packet),
+            }
+
+            if checksum_caps.icmpv6.tx() {
+                packet.fill_checksum(src_addr, dst_addr);
+            } else {
+                // make sure we get a consistently zeroed checksum, since implementations might rely on it
+                packet.set_checksum(0);
+            }
         }
     }
 

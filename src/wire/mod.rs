@@ -153,6 +153,8 @@ pub use self::sixlowpan::{
         UdpNhcRepr as SixlowpanUdpNhcRepr,
         UdpGhcPacket as SixlowpanUdpGhcPacket,
         UdpGhcRepr as SixlowpanUdpGhcRepr,
+        ICMPGhcPacket as SixlowpanICMPGhcPacket,
+        ICMPGhcRepr as SixlowpanICMPGhcRepr,
     },
     AddressContext as SixlowpanAddressContext, NextHeader as SixlowpanNextHeader, SixlowpanPacket,
 };

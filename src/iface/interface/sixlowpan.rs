@@ -208,6 +208,7 @@ impl InterfaceInner {
                         decompressed_size -= udp_repr.header_len();
                         IpProtocol::Udp
                     }
+                    SixlowpanNhcPacket::ICMPGhcHeader => todo!()
                 }
             }
             SixlowpanNextHeader::Uncompressed(proto) => proto,
@@ -282,6 +283,7 @@ impl InterfaceInner {
 
                         buffer[8..].copy_from_slice(&rfc7400::decompress(&mut rfc7400_decom_buffer, ipv6_repr.src_addr.as_bytes(), ipv6_repr.dst_addr.as_bytes(),&iphc.payload()[udp_repr.header_len()..],iphc.payload()[udp_repr.header_len()..].len()));
                     }
+                    SixlowpanNhcPacket::ICMPGhcHeader => todo!()
                 }
             }
             SixlowpanNextHeader::Uncompressed(_) => {
