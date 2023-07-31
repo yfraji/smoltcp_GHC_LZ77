@@ -25,7 +25,6 @@ bitflags = { version = "1.0", default-features = false }
 defmt = { version = "0.3", optional = true }
 cfg-if = "1.0.0"
 heapless = "0.7.8"
-rfc7400 = { path = "../../6LoWPAN-Generic-Header-Compression-Rust-implementation-and-evaluation/rfc7400/"}
 
 [dev-dependencies]
 env_logger = "0.10"

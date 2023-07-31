@@ -1,5 +1,5 @@
-use crate::iface::fragmentation::AssemblerFullError;
 use super::*;
+use crate::iface::fragmentation::AssemblerFullError;
 
 use crate::phy::ChecksumCapabilities;
 use crate::phy::TxToken;
@@ -208,7 +208,25 @@ impl InterfaceInner {
                         decompressed_size -= udp_repr.header_len();
                         IpProtocol::Udp
                     }
-                    SixlowpanNhcPacket::ICMPGhcHeader => todo!()
+                    SixlowpanNhcPacket::IcmpGhcHeader => {
+                        // TODO: we should first check that we can skip the dispatch field.
+                        // This field is already checked by the dispatch function, however,
+                        // maybe there are not enough bytes following the dispatch field and
+                        // we get an out-of-bounds panic.
+                        let mut decompressed = vec![0u8; 48];
+                        let payload = &iphc.payload()[1..];
+                        let decompressed = SixlowpanGhc::decompress(
+                            payload,
+                            &iphc_repr.src_addr,
+                            &iphc_repr.dst_addr,
+                            &mut decompressed,
+                        );
+
+                        decompressed_size -= iphc.payload().len();
+                        decompressed_size += decompressed.len();
+
+                        IpProtocol::Icmpv6
+                    }
                 }
             }
             SixlowpanNextHeader::Uncompressed(proto) => proto,
@@ -279,11 +297,30 @@ impl InterfaceInner {
                         );
                         udp_repr.0.emit_header(&mut udp, ipv6_repr.payload_len - 8);
 
-                        let mut rfc7400_decom_buffer = vec![0u8;48];
-
-                        buffer[8..].copy_from_slice(&rfc7400::decompress(&mut rfc7400_decom_buffer, ipv6_repr.src_addr.as_bytes(), ipv6_repr.dst_addr.as_bytes(),&iphc.payload()[udp_repr.header_len()..],iphc.payload()[udp_repr.header_len()..].len()));
+                        let mut decompressed = vec![0u8; 48];
+                        buffer[8..].copy_from_slice(SixlowpanGhc::decompress(
+                            &iphc.payload()[udp_repr.header_len()..],
+                            &ipv6_repr.src_addr,
+                            &ipv6_repr.dst_addr,
+                            &mut decompressed,
+                        ));
                     }
-                    SixlowpanNhcPacket::ICMPGhcHeader => todo!()
+                    SixlowpanNhcPacket::IcmpGhcHeader => {
+                        // TODO: we should first check that we can skip the dispatch field.
+                        // This field is already checked by the dispatch function, however,
+                        // maybe there are not enough bytes following the dispatch field and
+                        // we get an out-of-bounds panic.
+                        let mut decompressed = vec![0u8; 48];
+                        let payload = &iphc.payload()[1..];
+                        let decompressed = SixlowpanGhc::decompress(
+                            payload,
+                            &iphc_repr.src_addr,
+                            &iphc_repr.dst_addr,
+                            &mut decompressed,
+                        );
+
+                        buffer[..decompressed.len()].copy_from_slice(decompressed);
+                    }
                 }
             }
             SixlowpanNextHeader::Uncompressed(_) => {
@@ -342,7 +379,13 @@ impl InterfaceInner {
             dst_addr,
             ll_dst_addr: Some(ll_dst_a),
             next_header: match &packet {
-                IpPacket::Icmpv6(_) => SixlowpanNextHeader::Uncompressed(IpProtocol::Icmpv6),
+                IpPacket::Icmpv6(_) => {
+                    if self.use_sixlowpan_ghc {
+                        SixlowpanNextHeader::Compressed
+                    } else {
+                        SixlowpanNextHeader::Uncompressed(IpProtocol::Icmpv6)
+                    }
+                }
                 #[cfg(feature = "socket-tcp")]
                 IpPacket::Tcp(_) => SixlowpanNextHeader::Uncompressed(IpProtocol::Tcp),
                 #[cfg(feature = "socket-udp")]
@@ -374,8 +417,12 @@ impl InterfaceInner {
                     let udp_repr = SixlowpanUdpGhcRepr(udpv6_repr);
                     _compressed_headers_len += udp_repr.header_len();
                     _uncompressed_headers_len += udpv6_repr.header_len();
-                    total_size += udp_repr.header_len() + udp_repr.compressed_payload_len(payload, &iphc_repr.src_addr, &iphc_repr.dst_addr);
-
+                    total_size += udp_repr.header_len()
+                        + udp_repr.compressed_payload_len(
+                            payload,
+                            &iphc_repr.src_addr,
+                            &iphc_repr.dst_addr,
+                        );
                 } else {
                     let udp_repr = SixlowpanUdpNhcRepr(udpv6_repr);
                     _compressed_headers_len += udp_repr.header_len();
@@ -389,7 +436,33 @@ impl InterfaceInner {
             }
             #[cfg(feature = "proto-ipv6")]
             IpPacket::Icmpv6((_, icmp_repr)) => {
-                total_size += icmp_repr.buffer_len();
+                if self.use_sixlowpan_ghc {
+                    let mut buffer = [0; 127];
+                    let mut icmp_packet =
+                        Icmpv6Packet::new_unchecked(&mut buffer[..icmp_repr.buffer_len()]);
+                    icmp_repr.emit(
+                        &iphc_repr.src_addr.into(),
+                        &iphc_repr.dst_addr.into(),
+                        &mut icmp_packet,
+                        &ChecksumCapabilities::ignored(),
+                    );
+
+                    let payload = &buffer[..icmp_repr.buffer_len()];
+                    let mut compressed = vec![0u8; 48];
+                    let compressed = SixlowpanGhc::compress(
+                        payload,
+                        &iphc_repr.src_addr,
+                        &iphc_repr.dst_addr,
+                        &mut compressed,
+                    );
+
+                    _compressed_headers_len += compressed.len();
+                    _uncompressed_headers_len += icmp_repr.buffer_len();
+
+                    total_size += icmp_repr.buffer_len();
+                } else {
+                    total_size += icmp_repr.buffer_len();
+                }
             }
             #[allow(unreachable_patterns)]
             _ => unreachable!(),
@@ -433,16 +506,31 @@ impl InterfaceInner {
                         if self.use_sixlowpan_ghc {
                             let udp_repr = SixlowpanUdpGhcRepr(udpv6_repr);
                             let mut udp_packet = SixlowpanUdpGhcPacket::new_unchecked(
-                                &mut b[..udp_repr.header_len() + udp_repr.compressed_payload_len(payload, &iphc_repr.src_addr, &iphc_repr.dst_addr)],
+                                &mut b[..udp_repr.header_len()
+                                    + udp_repr.compressed_payload_len(
+                                        payload,
+                                        &iphc_repr.src_addr,
+                                        &iphc_repr.dst_addr,
+                                    )],
                             );
-                            let mut rfc7400_comp_buffer = vec![0u8;48];
-                            rfc7400::dictionary_buffer_init(&mut rfc7400_comp_buffer, &iphc_repr.src_addr.as_bytes(),&iphc_repr.dst_addr.as_bytes());
+                            let mut compressed = vec![0u8; 48];
                             udp_repr.emit(
                                 &mut udp_packet,
                                 &iphc_repr.src_addr,
                                 &iphc_repr.dst_addr,
-                                udp_repr.compressed_payload_len(payload, &iphc_repr.src_addr, &iphc_repr.dst_addr),
-                                |buf| buf.copy_from_slice(&rfc7400::compress(&mut rfc7400_comp_buffer, &iphc_repr.src_addr.as_bytes(), &iphc_repr.dst_addr.as_bytes(), payload, payload.len())[..]),
+                                udp_repr.compressed_payload_len(
+                                    payload,
+                                    &iphc_repr.src_addr,
+                                    &iphc_repr.dst_addr,
+                                ),
+                                |buf| {
+                                    buf.copy_from_slice(SixlowpanGhc::compress(
+                                        payload,
+                                        &iphc_repr.src_addr,
+                                        &iphc_repr.dst_addr,
+                                        &mut compressed,
+                                    ))
+                                },
                             );
                         } else {
                             let udp_repr = SixlowpanUdpNhcRepr(udpv6_repr);
@@ -471,14 +559,38 @@ impl InterfaceInner {
                     }
                     #[cfg(feature = "proto-ipv6")]
                     IpPacket::Icmpv6((_, icmp_repr)) => {
-                        let mut icmp_packet =
-                            Icmpv6Packet::new_unchecked(&mut b[..icmp_repr.buffer_len()]);
-                        icmp_repr.emit(
-                            &iphc_repr.src_addr.into(),
-                            &iphc_repr.dst_addr.into(),
-                            &mut icmp_packet,
-                            &self.caps.checksum,
-                        );
+                        if self.use_sixlowpan_ghc {
+                            let mut buffer = [0; 1500];
+                            let mut icmp_packet =
+                                Icmpv6Packet::new_unchecked(&mut buffer[..icmp_repr.buffer_len()]);
+                            icmp_repr.emit(
+                                &iphc_repr.src_addr.into(),
+                                &iphc_repr.dst_addr.into(),
+                                &mut icmp_packet,
+                                &ChecksumCapabilities::ignored(),
+                            );
+
+                            let payload = &buffer[..icmp_repr.buffer_len()];
+                            let mut compressed = vec![0u8; 48];
+                            let compressed = SixlowpanGhc::compress(
+                                payload,
+                                &iphc_repr.src_addr,
+                                &iphc_repr.dst_addr,
+                                &mut compressed,
+                            );
+
+                            b[0] = 0b11011111;
+                            b[1..compressed.len()].copy_from_slice(compressed);
+                        } else {
+                            let mut icmp_packet =
+                                Icmpv6Packet::new_unchecked(&mut b[..icmp_repr.buffer_len()]);
+                            icmp_repr.emit(
+                                &iphc_repr.src_addr.into(),
+                                &iphc_repr.dst_addr.into(),
+                                &mut icmp_packet,
+                                &self.caps.checksum,
+                            );
+                        }
                     }
                     #[allow(unreachable_patterns)]
                     _ => unreachable!(),
@@ -563,16 +675,31 @@ impl InterfaceInner {
                         if self.use_sixlowpan_ghc {
                             let udp_repr = SixlowpanUdpGhcRepr(udpv6_repr);
                             let mut udp_packet = SixlowpanUdpGhcPacket::new_unchecked(
-                                &mut tx_buf[..udp_repr.header_len() + udp_repr.compressed_payload_len(payload, &iphc_repr.src_addr, &iphc_repr.dst_addr)],
+                                &mut tx_buf[..udp_repr.header_len()
+                                    + udp_repr.compressed_payload_len(
+                                        payload,
+                                        &iphc_repr.src_addr,
+                                        &iphc_repr.dst_addr,
+                                    )],
                             );
-                            let mut rfc7400_comp_buffer = vec![0u8;48];
-                            rfc7400::dictionary_buffer_init(&mut rfc7400_comp_buffer, &iphc_repr.src_addr.as_bytes(),&iphc_repr.dst_addr.as_bytes());
+                            let mut compressed = vec![0u8; 48];
                             udp_repr.emit(
                                 &mut udp_packet,
                                 &iphc_repr.src_addr,
                                 &iphc_repr.dst_addr,
-                                udp_repr.compressed_payload_len(payload, &iphc_repr.src_addr, &iphc_repr.dst_addr),
-                                |buf| buf.copy_from_slice(&rfc7400::compress(&mut rfc7400_comp_buffer, &iphc_repr.src_addr.as_bytes(), &iphc_repr.dst_addr.as_bytes(), payload, payload.len())[..]),
+                                udp_repr.compressed_payload_len(
+                                    payload,
+                                    &iphc_repr.src_addr,
+                                    &iphc_repr.dst_addr,
+                                ),
+                                |buf| {
+                                    buf.copy_from_slice(SixlowpanGhc::compress(
+                                        payload,
+                                        &iphc_repr.src_addr,
+                                        &iphc_repr.dst_addr,
+                                        &mut compressed,
+                                    ))
+                                },
                             );
                         } else {
                             let udp_repr = SixlowpanUdpNhcRepr(udpv6_repr);
@@ -601,14 +728,38 @@ impl InterfaceInner {
                     }
                     #[cfg(feature = "proto-ipv6")]
                     IpPacket::Icmpv6((_, icmp_repr)) => {
-                        let mut icmp_packet =
-                            Icmpv6Packet::new_unchecked(&mut tx_buf[..icmp_repr.buffer_len()]);
-                        icmp_repr.emit(
-                            &iphc_repr.src_addr.into(),
-                            &iphc_repr.dst_addr.into(),
-                            &mut icmp_packet,
-                            &self.caps.checksum,
-                        );
+                        if self.use_sixlowpan_ghc {
+                            let mut buffer = [0; 1500];
+                            let mut icmp_packet =
+                                Icmpv6Packet::new_unchecked(&mut buffer[..icmp_repr.buffer_len()]);
+                            icmp_repr.emit(
+                                &iphc_repr.src_addr.into(),
+                                &iphc_repr.dst_addr.into(),
+                                &mut icmp_packet,
+                                &ChecksumCapabilities::ignored(),
+                            );
+
+                            let payload = &buffer[..icmp_repr.buffer_len()];
+                            let mut compressed = vec![0u8; 48];
+                            let compressed = SixlowpanGhc::compress(
+                                payload,
+                                &iphc_repr.src_addr,
+                                &iphc_repr.dst_addr,
+                                &mut compressed,
+                            );
+
+                            tx_buf[0] = 0b11011111;
+                            tx_buf[1..compressed.len()].copy_from_slice(compressed);
+                        } else {
+                            let mut icmp_packet =
+                                Icmpv6Packet::new_unchecked(&mut tx_buf[..icmp_repr.buffer_len()]);
+                            icmp_repr.emit(
+                                &iphc_repr.src_addr.into(),
+                                &iphc_repr.dst_addr.into(),
+                                &mut icmp_packet,
+                                &self.caps.checksum,
+                            );
+                        }
                     }
                     #[allow(unreachable_patterns)]
                     _ => unreachable!(),
@@ -669,6 +820,96 @@ impl InterfaceInner {
                 frag.sent_bytes += frag_size;
                 frag.sixlowpan.datagram_offset += frag_size;
             },
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decompress_icmp_ghc() {
+        let iface = crate::iface::interface::InterfaceInner::mock();
+
+        let ieee802154_repr = Ieee802154Repr {
+            frame_type: Ieee802154FrameType::Data,
+            security_enabled: false,
+            frame_pending: false,
+            ack_request: false,
+            sequence_number: Some(5),
+            pan_id_compression: true,
+            frame_version: Ieee802154FrameVersion::Ieee802154_2003,
+            dst_pan_id: Some(Ieee802154Pan(0xbeef)),
+            dst_addr: Some(Ieee802154Address::Extended([
+                0x90, 0xfc, 0x48, 0xc2, 0xa4, 0x41, 0xfc, 0x76,
+            ])),
+            src_pan_id: Some(Ieee802154Pan(0xbeef)),
+            src_addr: Some(Ieee802154Address::Extended([
+                0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x0b, 0x1a,
+            ])),
+        };
+
+        let iphc_icmp_ghc_compressed = [
+            0x6e, 0x33, 0xa, 0x62, 0x17, 0b11011111, 0x04, 0x9b, 0x00, 0x6b, 0xde, 0x82,
+        ];
+
+        let mut buffer = [0u8; 127];
+        let len = iface
+            .decompress_sixlowpan(
+                &ieee802154_repr,
+                &iphc_icmp_ghc_compressed,
+                None,
+                &mut buffer,
+            )
+            .unwrap();
+        let buffer = &buffer[..len];
+
+        assert_eq!(
+            buffer,
+            [
+                0x60, 0x0, 0x0, 0x0, 0x0, 0x8, 0x3a, 0x40, 0xfe, 0x80, 0x0, 0x0, 0x0, 0x0, 0x0,
+                0x0, 0x40, 0x42, 0x42, 0x42, 0x42, 0x42, 0xb, 0x1a, 0xfe, 0x80, 0x0, 0x0, 0x0, 0x0,
+                0x0, 0x0, 0x92, 0xfc, 0x48, 0xc2, 0xa4, 0x41, 0xfc, 0x76, 0x9b, 0x0, 0x6b, 0xde,
+                0x0, 0x0, 0x0, 0x0,
+            ]
+        );
+
+        let iphc_icmp_ghc_compressed = [
+            0x64, 0x0, 0x0, 0x0, 0x0, 0x5c, 0xff, 0xfe, 0x80, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x2,
+            0x1c, 0xda, 0xff, 0xfe, 0x0, 0x30, 0x23, 0xff, 0x2, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,
+            0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x1a, 0b11011111, 0x06, 0x9b, 0x01, 0x7a, 0x5f, 0x00,
+            0xf0, 0xc7, 0x01, 0x88, 0x81, 0x04, 0x20, 0x02, 0x0d, 0xb8, 0x85, 0xa7, 0xc9, 0x08,
+            0xfa, 0xce, 0x04, 0x0e, 0x00, 0x14, 0x09, 0xff, 0xa4, 0xda, 0x83, 0x06, 0x08, 0x1e,
+            0x80, 0x20, 0xff, 0xff, 0xc0, 0xd0, 0x82, 0xb4, 0xf0, 0x03, 0x03, 0x0e, 0x40, 0xc7,
+            0xa3, 0xc9, 0xa2, 0xf0,
+        ];
+
+        let mut buffer = [0u8; 127 * 2];
+        let len = iface
+            .decompress_sixlowpan(
+                &ieee802154_repr,
+                &iphc_icmp_ghc_compressed,
+                None,
+                &mut buffer,
+            )
+            .unwrap();
+        let buffer = &buffer[..len];
+
+        let ipv6_packet = Ipv6Packet::new_checked(buffer).unwrap();
+        let payload = ipv6_packet.payload();
+
+        assert_eq!(
+            payload,
+            [
+                0x9b, 0x01, 0x7a, 0x5f, 0x00, 0xf0, 0x01, 0x00, 0x88, 0x00, 0x00, 0x00, 0x20, 0x02,
+                0x0d, 0xb8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xfe, 0x00, 0xfa, 0xce,
+                0x04, 0x0e, 0x00, 0x14, 0x09, 0xff, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0x00, 0x08, 0x1e, 0x80, 0x20, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+                0x00, 0x00, 0x00, 0x00, 0x20, 0x02, 0x0d, 0xb8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0xff, 0xfe, 0x00, 0xfa, 0xce, 0x03, 0x0e, 0x40, 0x00, 0xff, 0xff, 0xff, 0xff,
+                0x20, 0x02, 0x0d, 0xb8, 0x00, 0x00, 0x00, 0x00
+            ]
         );
     }
 }

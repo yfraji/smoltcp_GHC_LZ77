@@ -7,6 +7,7 @@ use super::{Error, Result};
 use crate::wire::ieee802154::Address as LlAddress;
 use crate::wire::ipv6;
 use crate::wire::IpProtocol;
+use crate::wire::Ipv6Address;
 
 const ADDRESS_CONTEXT_LENGTH: usize = 8;
 
@@ -1397,7 +1398,10 @@ pub mod nhc {
     //! Implementation of Next Header Compression from [RFC 6282 § 4].
     //!
     //! [RFC 6282 § 4]: https://datatracker.ietf.org/doc/html/rfc6282#section-4
-    use super::{Error, NextHeader, Result, DISPATCH_EXT_HEADER, DISPATCH_UDP_HEADER, DISPATCH_UDP_GHC_HEADER, DISPATCH_ICMP_GHC_HEADER};
+    use super::{
+        Error, Ipv6Address, NextHeader, Result, DISPATCH_EXT_HEADER, DISPATCH_ICMP_GHC_HEADER,
+        DISPATCH_UDP_GHC_HEADER, DISPATCH_UDP_HEADER,
+    };
     use crate::{
         phy::ChecksumCapabilities,
         wire::{
@@ -1453,7 +1457,7 @@ pub mod nhc {
         ExtHeader,
         UdpHeader,
         UdpGhcHeader,
-        ICMPGhcHeader
+        IcmpGhcHeader,
     }
 
     impl NhcPacket {
@@ -1480,7 +1484,7 @@ pub mod nhc {
                 Ok(Self::UdpGhcHeader)
             } else if raw[0] == DISPATCH_ICMP_GHC_HEADER {
                 // We have a ICMP GHC packet
-                Ok(Self::ICMPGhcHeader)
+                Ok(Self::IcmpGhcHeader)
             } else {
                 Err(Error)
             }
@@ -1968,7 +1972,9 @@ pub mod nhc {
         ) -> Result<Self> {
             packet.check_len()?;
 
-            if packet.dispatch_field() != DISPATCH_UDP_HEADER {
+            if packet.dispatch_field() != DISPATCH_UDP_HEADER
+                && packet.dispatch_field() != DISPATCH_UDP_GHC_HEADER
+            {
                 return Err(Error);
             }
 
@@ -2058,6 +2064,337 @@ pub mod nhc {
         }
     }
 
+    pub mod ghc {
+        use super::*;
+
+        const COPY: u8 = 0x00;
+        const ZERO: u8 = 0x80;
+        const SET_BACKREF: u8 = 0xA0;
+        const BACKREF: u8 = 0xC0;
+        const DICO_SIZE: usize = 48;
+        const MAX_ZERO_SEQUENCE: usize = 17;
+
+        /// Initialize the compression/decompression dictionary.
+        pub fn dict_init(comp_buf: &mut [u8], src: &Ipv6Address, dst: &Ipv6Address) {
+            assert!(comp_buf.len() >= 48);
+
+            const STATIC_DICT: [u8; 16] = [
+                0x16, 0xfe, 0xfd, 0x17, 0xfe, 0xfd, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01,
+                0x00, 0x00,
+            ];
+
+            comp_buf[..16].copy_from_slice(&src.as_bytes()[..16]);
+            comp_buf[16..32].copy_from_slice(&dst.as_bytes()[..16]);
+            comp_buf[32..48].copy_from_slice(&STATIC_DICT[..16]);
+        }
+
+        pub fn decompress<'a>(
+            payload: &[u8],
+            src: &Ipv6Address,
+            dst: &Ipv6Address,
+            decompressed: &'a mut Vec<u8>,
+        ) -> &'a [u8] {
+            dict_init(decompressed, src, dst);
+
+            let mut decomp_buf_index: usize = DICO_SIZE;
+
+            let mut na = 0x00;
+            let mut sa = 0x00;
+
+            let len = payload.len();
+
+            let mut i = 0;
+
+            while i < len {
+                if (payload[i] & 0x80) == COPY {
+                    /* Codebyte : 0kkkkkkk
+                    Action   : Append k = 0b0kkkkkkk bytes of data in the
+                               bytecode argument (k < 96) */
+                    for j in 0..payload[i] {
+                        decompressed.push(payload[i + 1 + (j as usize)]);
+                    }
+                    decomp_buf_index += payload[i] as usize;
+                    i += payload[i] as usize;
+                } else if (payload[i] & 0xF0) == ZERO {
+                    /* Codebyte : 1000nnnn
+                    Action   : Append 0b0000nnnn+2 bytes of zeroes */
+                    for _ in 0..((payload[i] & 0x0F) + 2) {
+                        decompressed.push(0x00);
+                    }
+                    decomp_buf_index += ((payload[i] & 0x0F) + 2) as usize;
+                } else if (payload[i] & 0xE0) == SET_BACKREF {
+                    /* Codebyte : 101nssss
+                    Action   : Set up extended arguments for a
+                               backreference: sa += 0b0ssss000,
+                               na += 0b0000n000 */
+                    na += (payload[i] & 0x10) >> 1;
+                    sa += (payload[i] & 0x0F) << 3;
+                } else if (payload[i] & 0xC0) == BACKREF {
+                    /* Codebyte : 11nnnkkk
+                    Action   : Backreference: n = na+0b00000nnn+2;
+                               s = 0b00000kkk+sa+n; append n bytes from
+                               previously output bytes, starting s bytes
+                               to the left of the current output pointer;
+                               set sa = 0, na = 0 */
+                    let n = na + ((payload[i] & 0x38) >> 3) + 2;
+                    let s = (payload[i] & 0x07) + sa + n;
+                    for j in 0..n {
+                        decompressed.push(decompressed[decomp_buf_index - s as usize + j as usize]);
+                    }
+                    decomp_buf_index += n as usize;
+                    na = 0x00;
+                    sa = 0x00
+                }
+                i += 1;
+                continue;
+            }
+
+            &decompressed[DICO_SIZE..]
+        }
+
+        pub fn compress<'a>(
+            payload: &[u8],
+            src: &Ipv6Address,
+            dst: &Ipv6Address,
+            compressed: &'a mut Vec<u8>,
+        ) -> &'a [u8] {
+            let len = payload.len();
+            /* Initialize buffer with static dico followed by the payload */
+            let mut buffer = vec![0u8; DICO_SIZE + len];
+            dict_init(&mut buffer, src, dst);
+            buffer[DICO_SIZE..].copy_from_slice(payload);
+
+            let mut buffer_index = 0;
+            let mut copy_buffer = 0;
+            let mut payload_index = 0;
+
+            let mut i = 0;
+            while i < len {
+                /* Count zero sequence */
+                let mut zero_sequence = 0;
+                for (z, item) in payload.iter().enumerate().skip(i).take(MAX_ZERO_SEQUENCE) {
+                    if z < len && *item == 0x00 {
+                        zero_sequence += 1;
+                    } else {
+                        break;
+                    }
+                }
+
+                /* Initialize variables for matches in dico */
+                let mut index = 0;
+                let mut index_best = 0;
+                let mut append = 0;
+                let mut append_best = 0;
+
+                let mut dictionary_index = 0;
+                /* Browse the dictionary and the buffer to find matches */
+                while dictionary_index < i + DICO_SIZE {
+                    /* Found a first match */
+                    if (payload_index < len)
+                        && (append == 0)
+                        && (i + DICO_SIZE - dictionary_index > 1)
+                        && (payload[payload_index] == buffer[dictionary_index])
+                    {
+                        /* Condition to avoid overflow */
+                        if payload_index + 1 < len {
+                            /* Found a matching pair */
+                            if payload[payload_index + 1] == buffer[dictionary_index + 1] {
+                                index = dictionary_index;
+                                append = 2;
+
+                                if append >= append_best {
+                                    append_best = append;
+                                    index_best = index;
+                                }
+
+                                payload_index += 2;
+                                dictionary_index += 2;
+
+                                continue;
+                            }
+                        }
+                    }
+                    /* Found another match following previous matching pair */
+                    else if (payload_index < len)
+                        && (append > 0)
+                        && (payload[payload_index] == buffer[dictionary_index])
+                    {
+                        append += 1;
+
+                        if append >= append_best {
+                            append_best = append;
+                            index_best = index;
+                        }
+
+                        payload_index += 1;
+                        dictionary_index += 1;
+
+                        continue;
+                    }
+                    /* No more following match found, set best match sequence */
+                    else if (payload_index < len)
+                        && (append > 0)
+                        && (payload[payload_index] != buffer[dictionary_index])
+                    {
+                        if append >= append_best {
+                            append_best = append;
+                            index_best = index;
+                        }
+                        payload_index = i;
+                        dictionary_index -= append - 1;
+                        append = 0;
+                        index = 0;
+
+                        continue;
+                    }
+                    /* No match */
+                    dictionary_index += 1;
+                }
+                /* Set payload index */
+                payload_index = i;
+                /* Matches found */
+                /* Zero seq in dico
+                 * Max offset for backref is 9
+                 * No condition */
+                if (append_best > zero_sequence)
+                    && ((append_best < 3 && (i + DICO_SIZE - index_best) < 10)
+                        || (append_best > 2)
+                            && (i + DICO_SIZE - index_best - append_best + 2 < 120)
+                            && (((i + DICO_SIZE - index_best - append_best + 2) % 120) >= 2)
+                            && (append_best - 2 < 127))
+                {
+                    /* Reset copy_buffer */
+                    if copy_buffer > 0 {
+                        copy_buffer = 0;
+                    }
+                    /* Initialize for backref */
+                    let mut backref: u8 = 0xc0;
+                    /* Initialize n and s for backref */
+                    let n = append_best - 2;
+                    let s = i + DICO_SIZE - index_best - n;
+
+                    /* Set up for extended backreference */
+                    if n > 7 || s > 9 {
+                        let mut extended_n = n / 8;
+                        let backref_n = n % 8;
+                        let mut extended_s = s / 120;
+                        let backref_s = s % 120;
+
+                        /* Set variable for extended_s and extended_n */
+                        while extended_s > 0 {
+                            let mut extend_backref = 0xa0;
+                            if extended_n > 0 {
+                                extend_backref += 0x10;
+                                extended_n -= 1;
+                            }
+                            extend_backref += 0xf;
+                            extended_s -= 1;
+                            if buffer_index >= compressed.len() {
+                                compressed.push(extend_backref);
+                            } else {
+                                compressed[buffer_index] = extend_backref;
+                            }
+                            buffer_index += 1;
+                        }
+                        /* No offset extended_s but backref_s  */
+                        let mut extend_backref = 0xa0;
+                        if extended_n > 0 {
+                            extend_backref += 0x10;
+                            extended_n -= 1;
+                        }
+                        extend_backref += (((backref_s - 2) & 0x78) >> 3) as u8;
+                        if buffer_index >= compressed.len() {
+                            compressed.push(extend_backref);
+                        } else {
+                            compressed[buffer_index] = extend_backref;
+                        }
+                        buffer_index += 1;
+                        /* No or no more offset extended_s but extended_n */
+                        while extended_n > 0 {
+                            let extend_backref = 0xb0;
+                            if buffer_index >= compressed.len() {
+                                compressed.push(extend_backref);
+                            } else {
+                                compressed[buffer_index] = extend_backref;
+                            }
+                            extended_n -= 1;
+                            buffer_index += 1;
+                        }
+                        /* Set up backreference for the extended arguments */
+                        backref += ((backref_n << 3) + ((backref_s - 2) & 0x07)) as u8;
+
+                        if buffer_index >= compressed.len() {
+                            compressed.push(backref);
+                        } else {
+                            compressed[buffer_index] = backref;
+                        }
+                        buffer_index += 1;
+                    }
+                    /* Set up backreference */
+                    else {
+                        backref += ((n << 3) + s - 2) as u8;
+                        if buffer_index >= compressed.len() {
+                            compressed.push(backref);
+                        } else {
+                            compressed[buffer_index] = backref;
+                        }
+                        buffer_index += 1;
+                    }
+
+                    payload_index += append_best;
+                    i += append_best - 1;
+                } else if zero_sequence > 1 {
+                    /* Zero sequence */
+                    if buffer_index >= compressed.len() {
+                        compressed.push((0x80 + zero_sequence - 2) as u8);
+                    } else {
+                        compressed[buffer_index] = (0x80 + zero_sequence - 2) as u8;
+                    }
+                    buffer_index += 1;
+
+                    payload_index += zero_sequence;
+
+                    copy_buffer = 0;
+                    i += zero_sequence - 1;
+                } else {
+                    /* No match found in the dico and no zero seq found */
+                    if copy_buffer == 0 {
+                        if buffer_index >= compressed.len() {
+                            compressed.push((copy_buffer + 1) as u8);
+                        } else {
+                            compressed[buffer_index] = (copy_buffer + 1) as u8;
+                        }
+                        buffer_index += 1;
+                        if buffer_index >= compressed.len() {
+                            compressed.push(payload[payload_index]);
+                        } else {
+                            compressed[buffer_index] = payload[payload_index];
+                        }
+                        copy_buffer += 1;
+                        buffer_index += 1;
+                        payload_index += 1;
+                    } else {
+                        compressed[buffer_index - copy_buffer - 1] = (copy_buffer + 1) as u8;
+                        if buffer_index >= compressed.len() {
+                            compressed.push(payload[payload_index]);
+                        } else {
+                            compressed[buffer_index] = payload[payload_index];
+                        }
+
+                        copy_buffer += 1;
+                        buffer_index += 1;
+                        payload_index += 1;
+                        if copy_buffer > 95 {
+                            copy_buffer = 0;
+                        }
+                    }
+                }
+                i += 1;
+            }
+            &compressed[..buffer_index]
+        }
+    }
+
     /// A read/write wrapper around a 6LoWPAN_GHC UDP frame.
     /// [RFC 7400 § 3.1] specifies the format of the header.
     ///
@@ -2076,13 +2413,15 @@ pub mod nhc {
     #[derive(Debug, Clone)]
     #[cfg_attr(feature = "defmt", derive(defmt::Format))]
     pub struct UdpGhcPacket<T: AsRef<[u8]>> {
-        buffer: T,
+        udp_nhc: UdpNhcPacket<T>,
     }
 
     impl<T: AsRef<[u8]>> UdpGhcPacket<T> {
         /// Input a raw octet buffer with a LOWPAN_GHC frame structure for UDP.
         pub const fn new_unchecked(buffer: T) -> Self {
-            Self { buffer }
+            Self {
+                udp_nhc: UdpNhcPacket::new_unchecked(buffer),
+            }
         }
 
         /// Shorthand for a combination of [new_unchecked] and [check_len].
@@ -2098,7 +2437,7 @@ pub mod nhc {
         /// Ensure that no accessor method will panic if called.
         /// Returns `Err(Error::Truncated)` if the buffer is too short.
         pub fn check_len(&self) -> Result<()> {
-            let buffer = self.buffer.as_ref();
+            let buffer = self.udp_nhc.buffer.as_ref();
 
             if buffer.is_empty() {
                 return Err(Error);
@@ -2114,182 +2453,28 @@ pub mod nhc {
 
         /// Consumes the frame, returning the underlying buffer.
         pub fn into_inner(self) -> T {
-            self.buffer
-        }
-
-        get_field!(dispatch_field, 0b11111, 3);
-        get_field!(checksum_field, 0b1, 2);
-        get_field!(ports_field, 0b11, 0);
-
-        /// Returns the index of the start of the next header compressed fields.
-        const fn ghc_fields_start(&self) -> usize {
-            1
-        }
-
-        /// Return the source port number.
-        pub fn src_port(&self) -> u16 {
-            match self.ports_field() {
-                0b00 | 0b01 => {
-                    // The full 16 bits are carried in-line.
-                    let data = self.buffer.as_ref();
-                    let start = self.ghc_fields_start();
-
-                    NetworkEndian::read_u16(&data[start..start + 2])
-                }
-                0b10 => {
-                    // The first 8 bits are elided.
-                    let data = self.buffer.as_ref();
-                    let start = self.ghc_fields_start();
-
-                    0xf000 + data[start] as u16
-                }
-                0b11 => {
-                    // The first 12 bits are elided.
-                    let data = self.buffer.as_ref();
-                    let start = self.ghc_fields_start();
-
-                    0xf0b0 + (data[start] >> 4) as u16
-                }
-                _ => unreachable!(),
-            }
-        }
-
-        /// Return the destination port number.
-        pub fn dst_port(&self) -> u16 {
-            match self.ports_field() {
-                0b00 => {
-                    // The full 16 bits are carried in-line.
-                    let data = self.buffer.as_ref();
-                    let idx = self.ghc_fields_start();
-
-                    NetworkEndian::read_u16(&data[idx + 2..idx + 4])
-                }
-                0b01 => {
-                    // The first 8 bits are elided.
-                    let data = self.buffer.as_ref();
-                    let idx = self.ghc_fields_start();
-
-                    0xf000 + data[idx] as u16
-                }
-                0b10 => {
-                    // The full 16 bits are carried in-line.
-                    let data = self.buffer.as_ref();
-                    let idx = self.ghc_fields_start();
-
-                    NetworkEndian::read_u16(&data[idx + 1..idx + 1 + 2])
-                }
-                0b11 => {
-                    // The first 12 bits are elided.
-                    let data = self.buffer.as_ref();
-                    let start = self.ghc_fields_start();
-
-                    0xf0b0 + (data[start] & 0xff) as u16
-                }
-                _ => unreachable!(),
-            }
-        }
-
-        /// Return the checksum.
-        pub fn checksum(&self) -> Option<u16> {
-            if self.checksum_field() == 0b0 {
-                // The first 12 bits are elided.
-                let data = self.buffer.as_ref();
-                let start = self.ghc_fields_start() + self.ports_size();
-                Some(NetworkEndian::read_u16(&data[start..start + 2]))
-            } else {
-                // The checksum is elided and needs to be recomputed on the 6LoWPAN termination point.
-                None
-            }
-        }
-
-        // Return the size of the checksum field.
-        pub(crate) fn checksum_size(&self) -> usize {
-            match self.checksum_field() {
-                0b0 => 2,
-                0b1 => 0,
-                _ => unreachable!(),
-            }
-        }
-
-        /// Returns the total size of both port numbers.
-        pub(crate) fn ports_size(&self) -> usize {
-            match self.ports_field() {
-                0b00 => 4, // 16 bits + 16 bits
-                0b01 => 3, // 16 bits + 8 bits
-                0b10 => 3, // 8 bits + 16 bits
-                0b11 => 1, // 4 bits + 4 bits
-                _ => unreachable!(),
-            }
+            self.udp_nhc.buffer
         }
     }
 
-    impl<'a, T: AsRef<[u8]> + ?Sized> UdpGhcPacket<&'a T> {
-        /// Return a pointer to the payload.
-        pub fn payload(&self) -> &'a [u8] {
-            let start = 1 + self.ports_size() + self.checksum_size();
-            &self.buffer.as_ref()[start..]
-        }
-    }
-
-    impl<T: AsRef<[u8]> + AsMut<[u8]>> UdpGhcPacket<T> {
-        /// Return a mutable pointer to the payload.
-        pub fn payload_mut(&mut self) -> &mut [u8] {
-            let start = 1 + self.ports_size() + 2; // XXX(thvdveld): we assume we put the checksum inlined.
-            &mut self.buffer.as_mut()[start..]
-        }
-
-        /// Set the dispatch field to `0b11010`.
-        fn set_dispatch_field(&mut self) {
+    impl<T: AsRef<[u8]> + AsMut<[u8]>>UdpGhcPacket<T> {
+        pub fn set_dispatch_field(&mut self) {
             let data = self.buffer.as_mut();
             data[0] = (data[0] & !(0b11111 << 3)) | (DISPATCH_UDP_GHC_HEADER << 3);
         }
+    }
 
-        set_field!(set_checksum_field, 0b1, 2);
-        set_field!(set_ports_field, 0b11, 0);
+    impl<T: AsRef<[u8]>> core::ops::Deref for UdpGhcPacket<T> {
+        type Target = UdpNhcPacket<T>;
 
-        fn set_ports(&mut self, src_port: u16, dst_port: u16) {
-            let mut idx = 1;
-
-            match (src_port, dst_port) {
-                (0xf0b0..=0xf0bf, 0xf0b0..=0xf0bf) => {
-                    // We can compress both the source and destination ports.
-                    self.set_ports_field(0b11);
-                    let data = self.buffer.as_mut();
-                    data[idx] = (((src_port - 0xf0b0) as u8) << 4) & ((dst_port - 0xf0b0) as u8);
-                }
-                (0xf000..=0xf0ff, _) => {
-                    // We can compress the source port, but not the destination port.
-                    self.set_ports_field(0b10);
-                    let data = self.buffer.as_mut();
-                    data[idx] = (src_port - 0xf000) as u8;
-                    idx += 1;
-
-                    NetworkEndian::write_u16(&mut data[idx..idx + 2], dst_port);
-                }
-                (_, 0xf000..=0xf0ff) => {
-                    // We can compress the destination port, but not the source port.
-                    self.set_ports_field(0b01);
-                    let data = self.buffer.as_mut();
-                    NetworkEndian::write_u16(&mut data[idx..idx + 2], src_port);
-                    idx += 2;
-                    data[idx] = (dst_port - 0xf000) as u8;
-                }
-                (_, _) => {
-                    // We cannot compress any port.
-                    self.set_ports_field(0b00);
-                    let data = self.buffer.as_mut();
-                    NetworkEndian::write_u16(&mut data[idx..idx + 2], src_port);
-                    idx += 2;
-                    NetworkEndian::write_u16(&mut data[idx..idx + 2], dst_port);
-                }
-            };
+        fn deref(&self) -> &Self::Target {
+            &self.udp_nhc
         }
+    }
 
-        fn set_checksum(&mut self, checksum: u16) {
-            self.set_checksum_field(0b0);
-            let idx = 1 + self.ports_size();
-            let data = self.buffer.as_mut();
-            NetworkEndian::write_u16(&mut data[idx..idx + 2], checksum);
+    impl<T: AsRef<[u8]> + AsMut<[u8]>> core::ops::DerefMut for UdpGhcPacket<T> {
+        fn deref_mut(&mut self) -> &mut Self::Target {
+            &mut self.udp_nhc
         }
     }
 
@@ -2354,11 +2539,15 @@ pub mod nhc {
             }
         }
 
-        pub fn compressed_payload_len(&self, payload: &[u8], src_addr: &Address, dst_addr: &Address) -> usize {
-            let mut rfc7400_comp_buffer = vec![0u8;48];
-            rfc7400::dictionary_buffer_init(&mut rfc7400_comp_buffer, src_addr.as_bytes(), dst_addr.as_bytes());
-            let compressed_payload = rfc7400::compress(&mut rfc7400_comp_buffer, src_addr.as_bytes(), dst_addr.as_bytes(), payload, payload.len());
-            compressed_payload.len()
+        pub fn compressed_payload_len(
+            &self,
+            payload: &[u8],
+            src_addr: &Ipv6Address,
+            dst_addr: &Ipv6Address,
+        ) -> usize {
+            let mut compressed = vec![0u8; 48];
+            let compressed = ghc::compress(payload, src_addr, dst_addr, &mut compressed);
+            compressed.len()
         }
 
         /// Emit a high-level representation into a LOWPAN_GHC UDP header.
@@ -2405,629 +2594,139 @@ pub mod nhc {
         }
     }
 
-    use core::cmp;
-    use crate::wire::MldRepr;
-    #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
-    use crate::wire::NdiscRepr;
-    use crate::wire::{Ipv6Packet, Ipv6Repr};
-    use crate::wire::icmpv6::Message;
+    //use crate::wire::{Icmpv6Packet, Icmpv6Repr};
 
-    enum_with_unknown! {
-    /// Internet protocol control message subtype for type "Destination Unreachable".
-    pub enum DstUnreachable(u8) {
-        /// No Route to destination.
-        NoRoute         = 0,
-        /// Communication with destination administratively prohibited.
-        AdminProhibit   = 1,
-        /// Beyond scope of source address.
-        BeyondScope     = 2,
-        /// Address unreachable.
-        AddrUnreachable = 3,
-        /// Port unreachable.
-        PortUnreachable = 4,
-        /// Source address failed ingress/egress policy.
-        FailedPolicy    = 5,
-        /// Reject route to destination.
-        RejectRoute     = 6
-    }
-}
+    //#[derive(Debug, Clone)]
+    //#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+    //pub struct IcmpGhcPacket<T: AsRef<[u8]>> {
+    //icmp_nhc: Icmpv6Packet<T>,
+    //}
 
-    enum_with_unknown! {
-    /// Internet protocol control message subtype for the type "Parameter Problem".
-    pub enum ParamProblem(u8) {
-        /// Erroneous header field encountered.
-        ErroneousHdrField  = 0,
-        /// Unrecognized Next Header type encountered.
-        UnrecognizedNxtHdr = 1,
-        /// Unrecognized IPv6 option encountered.
-        UnrecognizedOption = 2
-    }
-}
+    //impl<T: AsRef<[u8]>> IcmpGhcPacket<T> {
+    ///// Input a raw octet buffer with a LOWPAN_GHC frame structure for UDP.
+    //pub const fn new_unchecked(buffer: T) -> Self {
+    //Self {
+    //icmp_nhc: Icmpv6Packet::new_unchecked(buffer),
+    //}
+    //}
 
-    enum_with_unknown! {
-    /// Internet protocol control message subtype for the type "Time Exceeded".
-    pub enum TimeExceeded(u8) {
-        /// Hop limit exceeded in transit.
-        HopLimitExceeded    = 0,
-        /// Fragment reassembly time exceeded.
-        FragReassemExceeded = 1
-    }
-}
+    ///// Shorthand for a combination of [new_unchecked] and [check_len].
+    /////
+    ///// [new_unchecked]: #method.new_unchecked
+    ///// [check_len]: #method.check_len
+    //pub fn new_checked(buffer: T) -> Result<Self> {
+    //let packet = Self::new_unchecked(buffer);
+    //packet.check_len()?;
+    //Ok(packet)
+    //}
 
-    /// A read/write wrapper around a 6LoWPAN_GHC ICMPv6 frame.
-    /// [RFC 7400 § 3.1] specifies the format of the header.
-    ///
-    /// The base header has the following formath:
-    /// ```txt
-    ///   0   1   2   3   4   5   6   7
-    /// +---+---+---+---+---+---+---+---+
-    /// | 1 | 1 | 0 | 1 | 1 | 1 | 1 | 1 |
-    /// +---+---+---+---+---+---+---+---+`
-    ///
-    /// [RFC 7400 § 3.1]: https://datatracker.ietf.org/doc/html/rfc7400#section-3.1
-    #[derive(Debug, Clone)]
-    #[cfg_attr(feature = "defmt", derive(defmt::Format))]
-    pub struct ICMPGhcPacket<T: AsRef<[u8]>> {
-        pub(super) buffer: T,
-    }
+    ///// Ensure that no accessor method will panic if called.
+    ///// Returns `Err(Error::Truncated)` if the buffer is too short.
+    //pub fn check_len(&self) -> Result<()> {
+    //let buffer = self.icmp_nhc.buffer.as_ref();
 
-    pub(super) mod field {
-        use crate::wire::field::*;
+    //if buffer.is_empty() {
+    //return Err(Error);
+    //}
 
-        // ICMPv6: See https://tools.ietf.org/html/rfc4443
-        pub const TYPE: usize = 0;
-        pub const CODE: usize = 1;
-        pub const CHECKSUM: Field = 2..4;
+    ////let index = 1 + self.ports_size() + self.checksum_size();
+    ////if index > buffer.len() {
+    ////return Err(Error);
+    ////}
 
-        pub const UNUSED: Field = 4..8;
-        pub const MTU: Field = 4..8;
-        pub const POINTER: Field = 4..8;
-        pub const ECHO_IDENT: Field = 4..6;
-        pub const ECHO_SEQNO: Field = 6..8;
+    //Ok(())
+    //}
 
-        pub const HEADER_END: usize = 8;
+    ///// Consumes the frame, returning the underlying buffer.
+    //pub fn into_inner(self) -> T {
+    //self.icmp_nhc.buffer
+    //}
+    //}
 
-        // NDISC: See https://tools.ietf.org/html/rfc4861
-        // Router Advertisement message offsets
-        pub const CUR_HOP_LIMIT: usize = 4;
-        pub const ROUTER_FLAGS: usize = 5;
-        pub const ROUTER_LT: Field = 6..8;
-        pub const REACHABLE_TM: Field = 8..12;
-        pub const RETRANS_TM: Field = 12..16;
+    //impl<T: AsRef<[u8]>> core::ops::Deref for IcmpGhcPacket<T> {
+    //type Target = Icmpv6Packet<T>;
 
-        // Neighbor Solicitation message offsets
-        pub const TARGET_ADDR: Field = 8..24;
+    //fn deref(&self) -> &Self::Target {
+    //&self.icmp_nhc
+    //}
+    //}
 
-        // Neighbor Advertisement message offsets
-        pub const NEIGH_FLAGS: usize = 4;
+    //impl<T: AsRef<[u8]> + AsMut<[u8]>> core::ops::DerefMut for IcmpGhcPacket<T> {
+    //fn deref_mut(&mut self) -> &mut Self::Target {
+    //&mut self.icmp_nhc
+    //}
+    //}
 
-        // Redirected Header message offsets
-        pub const DEST_ADDR: Field = 24..40;
+    ///// A high-level representation of a 6LoWPAN GHC UDP header.
+    //#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+    //#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+    //pub struct IcmpGhcRepr<'icmp>(pub Icmpv6Repr<'icmp>);
 
-        // MLD:
-        //   - https://tools.ietf.org/html/rfc3810
-        //   - https://tools.ietf.org/html/rfc3810
-        // Multicast Listener Query message
-        pub const MAX_RESP_CODE: Field = 4..6;
-        pub const QUERY_RESV: Field = 6..8;
-        pub const QUERY_MCAST_ADDR: Field = 8..24;
-        pub const SQRV: usize = 24;
-        pub const QQIC: usize = 25;
-        pub const QUERY_NUM_SRCS: Field = 26..28;
+    //impl<'icmp> IcmpGhcRepr<'icmp> {
+    ///// Parse a 6LoWPAN GHC UDP packet and return a high-level representation.
+    ///// The payload should already be decompressed.
+    //pub fn parse<T: AsRef<[u8]> + ?Sized>(
+    //packet: &IcmpGhcPacket<&'icmp T>,
+    //src_addr: &ipv6::Address,
+    //dst_addr: &ipv6::Address,
+    //checksum_caps: &ChecksumCapabilities,
+    //) -> Result<Self> {
+    //packet.check_len()?;
 
-        // Multicast Listener Report Message
-        pub const RECORD_RESV: Field = 4..6;
-        pub const NR_MCAST_RCRDS: Field = 6..8;
+    //if packet.dispatch_field() != DISPATCH_ICMP_GHC_HEADER {
+    //return Err(Error);
+    //}
 
-        // Multicast Address Record Offsets
-        pub const RECORD_TYPE: usize = 0;
-        pub const AUX_DATA_LEN: usize = 1;
-        pub const RECORD_NUM_SRCS: Field = 2..4;
-        pub const RECORD_MCAST_ADDR: Field = 4..20;
-    }
+    //Ok(Self(Icmpv6Repr::parse(
+    //src_addr,
+    //dst_addr,
+    //&Icmpv6Packet::new_unchecked(packet.payload()),
+    //&ChecksumCapabilities::ignored(),
+    //)))
+    //}
 
-    impl<T: AsRef<[u8]>> ICMPGhcPacket<T> {
+    ///// Return the length of a packet that will be emitted from this high-level representation.
+    //pub fn header_len(&self) -> usize {
+    //todo!();
+    //}
 
-        /// Input a raw octet buffer with a LOWPAN_GHC frame structure for UDP.
-        pub const fn new_unchecked(buffer: T) -> Self {
-            Self { buffer }
-        }
+    //pub fn compressed_payload_len(
+    //&self,
+    //payload: &[u8],
+    //src_addr: &Ipv6Address,
+    //dst_addr: &Ipv6Address,
+    //) -> usize {
+    //let mut compressed = vec![0u8; 48];
+    //let compressed = ghc::compress(payload, src_addr, dst_addr, &mut compressed);
+    //compressed.len()
+    //}
 
-        /// Shorthand for a combination of [new_unchecked] and [check_len].
-        ///
-        /// [new_unchecked]: #method.new_unchecked
-        /// [check_len]: #method.check_len
-        pub fn new_checked(buffer: T) -> Result<Self> {
-            let packet = Self::new_unchecked(buffer);
-            packet.check_len()?;
-            Ok(packet)
-        }
+    ///// Emit a high-level representation into a LOWPAN_GHC UDP header.
+    //pub fn emit<T: AsRef<[u8]> + AsMut<[u8]>>(
+    //&self,
+    //packet: &mut UdpGhcPacket<T>,
+    //src_addr: &Address,
+    //dst_addr: &Address,
+    //payload_len: usize,
+    //emit_payload: impl FnOnce(&mut [u8]),
+    //) {
+    //todo!();
+    //}
+    //}
 
-        /// Ensure that no accessor method will panic if called.
-        /// Returns `Err(Error)` if the buffer is too short.
-        pub fn check_len(&self) -> Result<()> {
-            let len = self.buffer.as_ref().len();
-            if len < field::HEADER_END || len < self.header_len() {
-                Err(Error)
-            } else {
-                Ok(())
-            }
-        }
+    //impl<'icmp> core::ops::Deref for IcmpGhcRepr<'icmp> {
+    //type Target = Icmpv6Repr<'icmp>;
 
-        /// Consumes the frame, returning the underlying buffer.
-        pub fn into_inner(self) -> T {
-            self.buffer
-        }
+    //fn deref(&self) -> &Self::Target {
+    //&self.0
+    //}
+    //}
 
-        /// Return the message type field.
-        #[inline]
-        pub fn msg_type(&self) -> Message {
-            let data = self.buffer.as_ref();
-            Message::from(data[field::TYPE])
-        }
-
-        /// Return the message code field.
-        #[inline]
-        pub fn msg_code(&self) -> u8 {
-            let data = self.buffer.as_ref();
-            data[field::CODE]
-        }
-
-        /// Return the checksum field.
-        #[inline]
-        pub fn checksum(&self) -> u16 {
-            let data = self.buffer.as_ref();
-            NetworkEndian::read_u16(&data[field::CHECKSUM])
-        }
-
-        /// Return the identifier field (for echo request and reply packets).
-        #[inline]
-        pub fn echo_ident(&self) -> u16 {
-            let data = self.buffer.as_ref();
-            NetworkEndian::read_u16(&data[field::ECHO_IDENT])
-        }
-
-        /// Return the sequence number field (for echo request and reply packets).
-        #[inline]
-        pub fn echo_seq_no(&self) -> u16 {
-            let data = self.buffer.as_ref();
-            NetworkEndian::read_u16(&data[field::ECHO_SEQNO])
-        }
-
-        /// Return the MTU field (for packet too big messages).
-        #[inline]
-        pub fn pkt_too_big_mtu(&self) -> u32 {
-            let data = self.buffer.as_ref();
-            NetworkEndian::read_u32(&data[field::MTU])
-        }
-
-        /// Return the pointer field (for parameter problem messages).
-        #[inline]
-        pub fn param_problem_ptr(&self) -> u32 {
-            let data = self.buffer.as_ref();
-            NetworkEndian::read_u32(&data[field::POINTER])
-        }
-
-        /// Return the header length. The result depends on the value of
-        /// the message type field.
-        pub fn header_len(&self) -> usize {
-            match self.msg_type() {
-                Message::DstUnreachable => field::UNUSED.end,
-                Message::PktTooBig => field::MTU.end,
-                Message::TimeExceeded => field::UNUSED.end,
-                Message::ParamProblem => field::POINTER.end,
-                Message::EchoRequest => field::ECHO_SEQNO.end,
-                Message::EchoReply => field::ECHO_SEQNO.end,
-                Message::RouterSolicit => field::UNUSED.end,
-                Message::RouterAdvert => field::RETRANS_TM.end,
-                Message::NeighborSolicit => field::TARGET_ADDR.end,
-                Message::NeighborAdvert => field::TARGET_ADDR.end,
-                Message::Redirect => field::DEST_ADDR.end,
-                Message::MldQuery => field::QUERY_NUM_SRCS.end,
-                Message::MldReport => field::NR_MCAST_RCRDS.end,
-                // For packets that are not included in RFC 4443, do not
-                // include the last 32 bits of the ICMPv6 header in
-                // `header_bytes`. This must be done so that these bytes
-                // can be accessed in the `payload`.
-                _ => field::CHECKSUM.end,
-            }
-        }
-
-        /// Validate the header checksum.
-        ///
-        /// # Fuzzing
-        /// This function always returns `true` when fuzzing.
-        pub fn verify_checksum(&self, src_addr: &IpAddress, dst_addr: &IpAddress) -> bool {
-            if cfg!(fuzzing) {
-                return true;
-            }
-
-            let data = self.buffer.as_ref();
-            checksum::combine(&[
-                checksum::pseudo_header(src_addr, dst_addr, IpProtocol::Icmpv6, data.len() as u32),
-                checksum::data(data),
-            ]) == !0
-        }
-    }
-
-    impl<'a, T: AsRef<[u8]> + ?Sized> ICMPGhcPacket<&'a T> {
-        /// Return a pointer to the type-specific data.
-        #[inline]
-        pub fn payload(&self) -> &'a [u8] {
-            let data = self.buffer.as_ref();
-            &data[self.header_len()..]
-        }
-    }
-
-    impl<T: AsRef<[u8]> + AsMut<[u8]>> ICMPGhcPacket<T> {
-        /// Set the message type field.
-        #[inline]
-        pub fn set_msg_type(&mut self, value: Message) {
-            let data = self.buffer.as_mut();
-            data[field::TYPE] = value.into()
-        }
-
-        /// Set the message code field.
-        #[inline]
-        pub fn set_msg_code(&mut self, value: u8) {
-            let data = self.buffer.as_mut();
-            data[field::CODE] = value
-        }
-
-        /// Clear any reserved fields in the message header.
-        ///
-        /// # Panics
-        /// This function panics if the message type has not been set.
-        /// See [set_msg_type].
-        ///
-        /// [set_msg_type]: #method.set_msg_type
-        #[inline]
-        pub fn clear_reserved(&mut self) {
-            match self.msg_type() {
-                Message::RouterSolicit
-                | Message::NeighborSolicit
-                | Message::NeighborAdvert
-                | Message::Redirect => {
-                    let data = self.buffer.as_mut();
-                    NetworkEndian::write_u32(&mut data[field::UNUSED], 0);
-                }
-                Message::MldQuery => {
-                    let data = self.buffer.as_mut();
-                    NetworkEndian::write_u16(&mut data[field::QUERY_RESV], 0);
-                    data[field::SQRV] &= 0xf;
-                }
-                Message::MldReport => {
-                    let data = self.buffer.as_mut();
-                    NetworkEndian::write_u16(&mut data[field::RECORD_RESV], 0);
-                }
-                ty => panic!("Message type `{ty}` does not have any reserved fields."),
-            }
-        }
-
-        #[inline]
-        pub fn set_checksum(&mut self, value: u16) {
-            let data = self.buffer.as_mut();
-            NetworkEndian::write_u16(&mut data[field::CHECKSUM], value)
-        }
-
-        /// Set the identifier field (for echo request and reply packets).
-        ///
-        /// # Panics
-        /// This function may panic if this packet is not an echo request or reply packet.
-        #[inline]
-        pub fn set_echo_ident(&mut self, value: u16) {
-            let data = self.buffer.as_mut();
-            NetworkEndian::write_u16(&mut data[field::ECHO_IDENT], value)
-        }
-
-        /// Set the sequence number field (for echo request and reply packets).
-        ///
-        /// # Panics
-        /// This function may panic if this packet is not an echo request or reply packet.
-        #[inline]
-        pub fn set_echo_seq_no(&mut self, value: u16) {
-            let data = self.buffer.as_mut();
-            NetworkEndian::write_u16(&mut data[field::ECHO_SEQNO], value)
-        }
-
-        /// Set the MTU field (for packet too big messages).
-        ///
-        /// # Panics
-        /// This function may panic if this packet is not an packet too big packet.
-        #[inline]
-        pub fn set_pkt_too_big_mtu(&mut self, value: u32) {
-            let data = self.buffer.as_mut();
-            NetworkEndian::write_u32(&mut data[field::MTU], value)
-        }
-
-        /// Set the pointer field (for parameter problem messages).
-        ///
-        /// # Panics
-        /// This function may panic if this packet is not a parameter problem message.
-        #[inline]
-        pub fn set_param_problem_ptr(&mut self, value: u32) {
-            let data = self.buffer.as_mut();
-            NetworkEndian::write_u32(&mut data[field::POINTER], value)
-        }
-
-        /// Compute and fill in the header checksum.
-        pub fn fill_checksum(&mut self, src_addr: &IpAddress, dst_addr: &IpAddress) {
-            self.set_checksum(0);
-            let checksum = {
-                let data = self.buffer.as_ref();
-                !checksum::combine(&[
-                    checksum::pseudo_header(src_addr, dst_addr, IpProtocol::Icmpv6, data.len() as u32),
-                    checksum::data(data),
-                ])
-            };
-            self.set_checksum(checksum)
-        }
-
-        /// Return a mutable pointer to the type-specific data.
-        #[inline]
-        pub fn payload_mut(&mut self) -> &mut [u8] {
-            let range = self.header_len()..;
-            let data = self.buffer.as_mut();
-            &mut data[range]
-        }
-    }
-
-    impl<T: AsRef<[u8]>> AsRef<[u8]> for ICMPGhcPacket<T> {
-        fn as_ref(&self) -> &[u8] {
-            self.buffer.as_ref()
-        }
-    }
-
-    /// A high-level representation of an GHC Internet Control Message Protocol version 6 packet header.
-    #[derive(Debug, PartialEq, Eq, Clone, Copy)]
-    #[cfg_attr(feature = "defmt", derive(defmt::Format))]
-    #[non_exhaustive]
-    pub enum ICMPGhcRepr<'a> {
-        DstUnreachable {
-            reason: DstUnreachable,
-            header: Ipv6Repr,
-            data: &'a [u8],
-        },
-        PktTooBig {
-            mtu: u32,
-            header: Ipv6Repr,
-            data: &'a [u8],
-        },
-        TimeExceeded {
-            reason: TimeExceeded,
-            header: Ipv6Repr,
-            data: &'a [u8],
-        },
-        ParamProblem {
-            reason: ParamProblem,
-            pointer: u32,
-            header: Ipv6Repr,
-            data: &'a [u8],
-        },
-        EchoRequest {
-            ident: u16,
-            seq_no: u16,
-            data: &'a [u8],
-        },
-        EchoReply {
-            ident: u16,
-            seq_no: u16,
-            data: &'a [u8],
-        },
-        #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
-        Ndisc(NdiscRepr<'a>),
-        Mld(MldRepr<'a>),
-    }
-
-    use crate::wire::icmpv6::Packet;
-
-    impl<'a> ICMPGhcRepr<'a> {
-        /// Parse an Internet Control Message Protocol version 6 packet and return
-        /// a high-level representation..
-        pub fn parse<T>(
-            src_addr: &IpAddress,
-            dst_addr: &IpAddress,
-            packet: &Packet<&'a T>,
-            checksum_caps: &ChecksumCapabilities,
-        ) -> Result<ICMPGhcRepr<'a>>
-            where
-                T: AsRef<[u8]> + ?Sized,
-        {
-            fn create_packet_from_payload<'a, T>(packet: &Packet<&'a T>) -> Result<(&'a [u8], Ipv6Repr)>
-                where
-                    T: AsRef<[u8]> + ?Sized,
-            {
-                let ip_packet = Ipv6Packet::new_checked(packet.payload())?;
-
-                let payload = &packet.payload()[ip_packet.header_len()..];
-                if payload.len() < 8 {
-                    return Err(Error);
-                }
-                let repr = Ipv6Repr {
-                    src_addr: ip_packet.src_addr(),
-                    dst_addr: ip_packet.dst_addr(),
-                    next_header: ip_packet.next_header(),
-                    payload_len: payload.len(),
-                    hop_limit: ip_packet.hop_limit(),
-                };
-                Ok((payload, repr))
-            }
-            // Valid checksum is expected.
-            if checksum_caps.icmpv6.rx() && !packet.verify_checksum(src_addr, dst_addr) {
-                return Err(Error);
-            }
-
-            match (packet.msg_type(), packet.msg_code()) {
-                (Message::DstUnreachable, code) => {
-                    let (payload, repr) = create_packet_from_payload(packet)?;
-                    Ok(ICMPGhcRepr::DstUnreachable {
-                        reason: DstUnreachable::from(code),
-                        header: repr,
-                        data: payload,
-                    })
-                }
-                (Message::PktTooBig, 0) => {
-                    let (payload, repr) = create_packet_from_payload(packet)?;
-                    Ok(ICMPGhcRepr::PktTooBig {
-                        mtu: packet.pkt_too_big_mtu(),
-                        header: repr,
-                        data: payload,
-                    })
-                }
-                (Message::TimeExceeded, code) => {
-                    let (payload, repr) = create_packet_from_payload(packet)?;
-                    Ok(ICMPGhcRepr::TimeExceeded {
-                        reason: TimeExceeded::from(code),
-                        header: repr,
-                        data: payload,
-                    })
-                }
-                (Message::ParamProblem, code) => {
-                    let (payload, repr) = create_packet_from_payload(packet)?;
-                    Ok(ICMPGhcRepr::ParamProblem {
-                        reason: ParamProblem::from(code),
-                        pointer: packet.param_problem_ptr(),
-                        header: repr,
-                        data: payload,
-                    })
-                }
-                (Message::EchoRequest, 0) => Ok(ICMPGhcRepr::EchoRequest {
-                    ident: packet.echo_ident(),
-                    seq_no: packet.echo_seq_no(),
-                    data: packet.payload(),
-                }),
-                (Message::EchoReply, 0) => Ok(ICMPGhcRepr::EchoReply {
-                    ident: packet.echo_ident(),
-                    seq_no: packet.echo_seq_no(),
-                    data: packet.payload(),
-                }),
-                #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
-                (msg_type, 0) if msg_type.is_ndisc() => NdiscRepr::parse(packet).map(ICMPGhcRepr::Ndisc),
-                (msg_type, 0) if msg_type.is_mld() => MldRepr::parse(packet).map(ICMPGhcRepr::Mld),
-                _ => Err(Error),
-            }
-        }
-
-        /// Return the length of a packet that will be emitted from this high-level representation.
-        pub const fn buffer_len(&self) -> usize {
-            match self {
-                &ICMPGhcRepr::DstUnreachable { header, data, .. }
-                | &ICMPGhcRepr::PktTooBig { header, data, .. }
-                | &ICMPGhcRepr::TimeExceeded { header, data, .. }
-                | &ICMPGhcRepr::ParamProblem { header, data, .. } => {
-                    field::UNUSED.end + header.buffer_len() + data.len()
-                }
-                &ICMPGhcRepr::EchoRequest { data, .. } | &ICMPGhcRepr::EchoReply { data, .. } => {
-                    field::ECHO_SEQNO.end + data.len()
-                }
-                #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
-                &ICMPGhcRepr::Ndisc(ndisc) => ndisc.buffer_len(),
-                &ICMPGhcRepr::Mld(mld) => mld.buffer_len(),
-            }
-        }
-
-        /// Emit a high-level representation into an Internet Control Message Protocol version 6
-        /// packet.
-        pub fn emit<T>(
-            &self,
-            src_addr: &IpAddress,
-            dst_addr: &IpAddress,
-            packet: &mut Packet<&mut T>,
-            checksum_caps: &ChecksumCapabilities,
-        ) where
-            T: AsRef<[u8]> + AsMut<[u8]> + ?Sized,
-        {
-            fn emit_contained_packet(buffer: &mut [u8], header: Ipv6Repr, data: &[u8]) {
-                let mut ip_packet = Ipv6Packet::new_unchecked(buffer);
-                header.emit(&mut ip_packet);
-                let payload = &mut ip_packet.into_inner()[header.buffer_len()..];
-                payload.copy_from_slice(data);
-            }
-
-            match *self {
-                ICMPGhcRepr::DstUnreachable {
-                    reason,
-                    header,
-                    data,
-                } => {
-                    packet.set_msg_type(Message::DstUnreachable);
-                    packet.set_msg_code(reason.into());
-
-                    emit_contained_packet(packet.payload_mut(), header, data);
-                }
-
-                ICMPGhcRepr::PktTooBig { mtu, header, data } => {
-                    packet.set_msg_type(Message::PktTooBig);
-                    packet.set_msg_code(0);
-                    packet.set_pkt_too_big_mtu(mtu);
-
-                    emit_contained_packet(packet.payload_mut(), header, data);
-                }
-
-                ICMPGhcRepr::TimeExceeded {
-                    reason,
-                    header,
-                    data,
-                } => {
-                    packet.set_msg_type(Message::TimeExceeded);
-                    packet.set_msg_code(reason.into());
-
-                    emit_contained_packet(packet.payload_mut(), header, data);
-                }
-
-                ICMPGhcRepr::ParamProblem {
-                    reason,
-                    pointer,
-                    header,
-                    data,
-                } => {
-                    packet.set_msg_type(Message::ParamProblem);
-                    packet.set_msg_code(reason.into());
-                    packet.set_param_problem_ptr(pointer);
-
-                    emit_contained_packet(packet.payload_mut(), header, data);
-                }
-
-                ICMPGhcRepr::EchoRequest {
-                    ident,
-                    seq_no,
-                    data,
-                } => {
-                    packet.set_msg_type(Message::EchoRequest);
-                    packet.set_msg_code(0);
-                    packet.set_echo_ident(ident);
-                    packet.set_echo_seq_no(seq_no);
-                    let data_len = cmp::min(packet.payload_mut().len(), data.len());
-                    packet.payload_mut()[..data_len].copy_from_slice(&data[..data_len])
-                }
-
-                ICMPGhcRepr::EchoReply {
-                    ident,
-                    seq_no,
-                    data,
-                } => {
-                    packet.set_msg_type(Message::EchoReply);
-                    packet.set_msg_code(0);
-                    packet.set_echo_ident(ident);
-                    packet.set_echo_seq_no(seq_no);
-                    let data_len = cmp::min(packet.payload_mut().len(), data.len());
-                    packet.payload_mut()[..data_len].copy_from_slice(&data[..data_len])
-                }
-
-                #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
-                ICMPGhcRepr::Ndisc(ndisc) => ndisc.emit(packet),
-
-                ICMPGhcRepr::Mld(mld) => mld.emit(packet),
-            }
-
-            if checksum_caps.icmpv6.tx() {
-                packet.fill_checksum(src_addr, dst_addr);
-            } else {
-                // make sure we get a consistently zeroed checksum, since implementations might rely on it
-                packet.set_checksum(0);
-            }
-        }
-    }
+    //impl<'icmp> core::ops::DerefMut for IcmpGhcRepr<'icmp> {
+    //fn deref_mut(&mut self) -> &mut Self::Target {
+    //&mut self.0
+    //}
+    //}
 
     #[cfg(test)]
     mod test {
@@ -3126,17 +2825,36 @@ pub mod nhc {
             let mut buffer = [0u8; 127];
             let mut packet = UdpGhcPacket::new_unchecked(&mut buffer[..len]);
 
-            let mut rfc7400_comp_buffer = vec![0u8;48];
-            rfc7400::dictionary_buffer_init(&mut rfc7400_comp_buffer, &src_addr.as_bytes(), &dst_addr.as_bytes());
-
-            udp.emit(&mut packet, &src_addr, &dst_addr, udp.compressed_payload_len(payload, &src_addr, &dst_addr), |buf| {
-                buf.copy_from_slice(&rfc7400::compress(&mut rfc7400_comp_buffer, &src_addr.as_bytes(), &dst_addr.as_bytes(), payload, payload.len())[..])
-            });
+            let mut compressed = vec![0u8; 48];
+            udp.emit(
+                &mut packet,
+                &src_addr,
+                &dst_addr,
+                udp.compressed_payload_len(payload, &src_addr, &dst_addr),
+                |buf| {
+                    buf.copy_from_slice(
+                        &ghc::compress(
+                            payload,
+                            &src_addr,
+                            &dst_addr,
+                            &mut compressed,
+                        )[..],
+                    )
+                },
+            );
 
             assert_eq!(packet.dispatch_field(), DISPATCH_UDP_GHC_HEADER);
             assert_eq!(packet.src_port(), 0xf0b1);
             assert_eq!(packet.dst_port(), 0xf001);
-            assert_eq!(packet.payload_mut(), rfc7400::compress(&mut rfc7400_comp_buffer, &src_addr.as_bytes(), &dst_addr.as_bytes(), payload, payload.len()));
+            assert_eq!(
+                packet.payload_mut(),
+                ghc::compress(
+                    payload,
+                    &src_addr,
+                    &dst_addr,
+                    &mut compressed,
+                )
+            );
         }
     }
 }
